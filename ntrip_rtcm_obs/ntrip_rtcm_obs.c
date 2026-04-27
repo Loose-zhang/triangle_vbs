@@ -117,6 +117,9 @@ static rtklib_lock_t g_tx_lock;
 static sock_t g_tx_listen = SOCK_INVALID;
 static sock_t g_tx_conn = SOCK_INVALID;
 
+static void print_enter(void);
+static void print_leave(void);
+
 static void print_init(void)
 {
     rtklib_initlock(&g_print_lock);
@@ -152,14 +155,20 @@ static DWORD WINAPI rtcm_out_server_thread(LPVOID arg)
     a.sin_port = htons(RTCM_OUT_PORT);
     if (bind(ls, (struct sockaddr *)&a, sizeof(a)) != 0 ||
         listen(ls, 2) != 0) {
+        print_enter();
         fprintf(stderr, "RTCM TCP out: bind/listen port %u failed (%d)\n",
                 (unsigned)RTCM_OUT_PORT, sock_errno);
+        fflush(stderr);
+        print_leave();
         sock_close(ls);
         return 0;
     }
     g_tx_listen = ls;
+    print_enter();
     fprintf(stderr, "RTCM TCP out: listening on port %u (connect to receive stream)\n",
             (unsigned)RTCM_OUT_PORT);
+    fflush(stderr);
+    print_leave();
     for (;;) {
         c = accept(ls, NULL, NULL);
         if (c == SOCK_INVALID) continue;
@@ -186,14 +195,20 @@ static void *rtcm_out_server_thread(void *arg)
     a.sin_port = htons(RTCM_OUT_PORT);
     if (bind(ls, (struct sockaddr *)&a, sizeof(a)) != 0 ||
         listen(ls, 2) != 0) {
+        print_enter();
         fprintf(stderr, "RTCM TCP out: bind/listen port %u failed (%d)\n",
                 (unsigned)RTCM_OUT_PORT, sock_errno);
+        fflush(stderr);
+        print_leave();
         sock_close(ls);
         return NULL;
     }
     g_tx_listen = ls;
+    print_enter();
     fprintf(stderr, "RTCM TCP out: listening on port %u (connect to receive stream)\n",
             (unsigned)RTCM_OUT_PORT);
+    fflush(stderr);
+    print_leave();
     for (;;) {
         c = accept(ls, NULL, NULL);
         if (c == SOCK_INVALID) continue;
@@ -590,6 +605,61 @@ static const struct { int sys; int type; } k_msm7[] = {
 
 #define N_MSM7 (int)(sizeof(k_msm7) / sizeof(k_msm7[0]))
 
+typedef struct {
+    int type;
+    int n;
+    obsd_t data[MAXOBS];
+} msm_chunk_t;
+
+static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunks)
+{
+    int k, i, j, n, ns, nobs, nsig, code, nchunk = 0;
+    int mask[MAXCODE];
+    const obsd_t *data = obs->data;
+
+    for (k = 0; k < N_MSM7; k++) {
+        memset(mask, 0, sizeof(mask));
+        nobs = nsig = 0;
+
+        for (i = 0; i < obs->n && i < MAXOBS; i++) {
+            if (satsys(data[i].sat, NULL) != k_msm7[k].sys) continue;
+            nobs++;
+            for (j = 0; j < NFREQ + NEXOBS; j++) {
+                code = data[i].code[j];
+                if (!code || code > MAXCODE || mask[code - 1]) continue;
+                mask[code - 1] = 1;
+                nsig++;
+            }
+        }
+        if (nobs <= 0 || nsig <= 0) continue;
+
+        ns = 64 / nsig;
+        if (ns <= 0) continue;
+
+        for (i = 0; i < obs->n && i < MAXOBS;) {
+            msm_chunk_t *chunk;
+
+            while (i < obs->n && i < MAXOBS &&
+                   satsys(data[i].sat, NULL) != k_msm7[k].sys) {
+                i++;
+            }
+            if (i >= obs->n || i >= MAXOBS) break;
+            if (nchunk >= max_chunks) return nchunk;
+
+            chunk = &chunks[nchunk++];
+            chunk->type = k_msm7[k].type;
+            chunk->n = 0;
+
+            for (n = 0; n < ns && i < obs->n && i < MAXOBS; i++) {
+                if (satsys(data[i].sat, NULL) != k_msm7[k].sys) continue;
+                chunk->data[chunk->n++] = data[i];
+                n++;
+            }
+        }
+    }
+    return nchunk;
+}
+
 /* Two bases: Apollonius on (P1,P2,b); L from P_mid/λ. Encode RTCM 1005 + MSM7, TCP :52000. */
 static void try_synth_virtual_obs(void)
 {
@@ -597,8 +667,8 @@ static void try_synth_virtual_obs(void)
     double P0, P1, Pm_sq, Pm, b, freq, lam, LfromP;
     double mid[3];
     int i0, i1, j, j1, sat, prn, sys;
-    int nv, k, msm_count, t;
-    int sys_msm_idx[N_MSM7];
+    int nv, k, msm_count;
+    msm_chunk_t msm_chunks[N_MSM7 * MAXOBS];
     uint8_t tx_agg[16384];
     int tx_agg_len = 0;
     int dec_obs = 0, dec_sta = 0, dec_err = 0;
@@ -694,11 +764,8 @@ static void try_synth_virtual_obs(void)
     g_enc_rtcm.obs.n = nv;
     memcpy(g_enc_rtcm.obs.data, virt, (size_t)nv * sizeof(obsd_t));
 
-    msm_count = 0;
-    for (k = 0; k < N_MSM7; k++) {
-        if (obs_has_any_for_sys(&g_enc_rtcm.obs, k_msm7[k].sys))
-            sys_msm_idx[msm_count++] = k;
-    }
+    msm_count = build_msm_chunks(&g_enc_rtcm.obs, msm_chunks,
+                                 (int)(sizeof(msm_chunks) / sizeof(msm_chunks[0])));
 
     if (gen_rtcm3(&g_enc_rtcm, 1005, 0, msm_count > 0 ? 1 : 0)) {
         if (tx_agg_len + g_enc_rtcm.nbyte <= (int)sizeof(tx_agg)) {
@@ -708,35 +775,20 @@ static void try_synth_virtual_obs(void)
         tx_send_buf(g_enc_rtcm.buff, g_enc_rtcm.nbyte);
     }
 
-    /* sync=1 = more RTCM follows. Last MSM must have sync=0 or decode_msm7 returns 0 (not 1).
-     * If a later gen_rtcm3 fails, the previous MSM must not keep sync=1: probe encode first. */
-    {
-        int ok[N_MSM7];
-        int last_ok_t = -1;
+    for (k = 0; k < msm_count; k++) {
+        g_enc_rtcm.obs.n = msm_chunks[k].n;
+        memcpy(g_enc_rtcm.obs.data, msm_chunks[k].data,
+               (size_t)msm_chunks[k].n * sizeof(obsd_t));
 
-        memset(ok, 0, sizeof(ok));
-        for (t = 0; t < msm_count; t++) {
-            k = sys_msm_idx[t];
-            ok[t] = gen_rtcm3(&g_enc_rtcm, k_msm7[k].type, 0, 0);
+        if (!gen_rtcm3(&g_enc_rtcm, msm_chunks[k].type, 0,
+                       k != msm_count - 1 ? 1 : 0)) {
+            continue;
         }
-        for (t = msm_count - 1; t >= 0; t--) {
-            if (ok[t]) {
-                last_ok_t = t;
-                break;
-            }
+        if (tx_agg_len + g_enc_rtcm.nbyte <= (int)sizeof(tx_agg)) {
+            memcpy(tx_agg + tx_agg_len, g_enc_rtcm.buff, (size_t)g_enc_rtcm.nbyte);
+            tx_agg_len += g_enc_rtcm.nbyte;
         }
-        for (t = 0; t < msm_count; t++) {
-            if (!ok[t])
-                continue;
-            k = sys_msm_idx[t];
-            if (!gen_rtcm3(&g_enc_rtcm, k_msm7[k].type, 0, t != last_ok_t ? 1 : 0))
-                continue;
-            if (tx_agg_len + g_enc_rtcm.nbyte <= (int)sizeof(tx_agg)) {
-                memcpy(tx_agg + tx_agg_len, g_enc_rtcm.buff, (size_t)g_enc_rtcm.nbyte);
-                tx_agg_len += g_enc_rtcm.nbyte;
-            }
-            tx_send_buf(g_enc_rtcm.buff, g_enc_rtcm.nbyte);
-        }
+        tx_send_buf(g_enc_rtcm.buff, g_enc_rtcm.nbyte);
     }
 
     /* Fresh frame sync for verify pass (avoids stray 0xD3 in decoder state). */
@@ -771,11 +823,12 @@ static int winsock_startup(void)
     return 0;
 }
 
-static sock_t tcp_connect_host(const char *host, unsigned short port)
+static sock_t tcp_connect_host(const char *host, unsigned short port, int *err)
 {
     char serv[16];
     struct addrinfo hints, *res = NULL, *p;
     sock_t s = SOCK_INVALID;
+    int e;
 
     snprintf(serv, sizeof(serv), "%u", (unsigned)port);
     memset(&hints, 0, sizeof(hints));
@@ -783,8 +836,12 @@ static sock_t tcp_connect_host(const char *host, unsigned short port)
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    if (getaddrinfo(host, serv, &hints, &res) != 0)
+    if (err) *err = 0;
+
+    if ((e = getaddrinfo(host, serv, &hints, &res)) != 0) {
+        if (err) *err = e;
         return SOCK_INVALID;
+    }
 
     for (p = res; p != NULL; p = p->ai_next) {
         s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -792,6 +849,7 @@ static sock_t tcp_connect_host(const char *host, unsigned short port)
             continue;
         if (connect(s, p->ai_addr, (int)p->ai_addrlen) == 0)
             break;
+        if (err) *err = sock_errno;
         sock_close(s);
         s = SOCK_INVALID;
     }
@@ -857,13 +915,14 @@ static void stream_connect_forever(stream_worker_t *w)
     const char *host = w->s.host;
     unsigned short port = w->s.port;
     const char *lab = worker_label(w);
+    int err;
 
     for (;;) {
-        sock_t s = tcp_connect_host(host, port);
+        sock_t s = tcp_connect_host(host, port, &err);
         if (s == SOCK_INVALID) {
             print_enter();
             fprintf(stderr, "[%s] connect %s:%u failed (%d), retry in 2s...\n",
-                    lab, host, (unsigned)port, sock_errno);
+                    lab, host, (unsigned)port, err);
             fflush(stderr);
             print_leave();
 #ifdef _WIN32

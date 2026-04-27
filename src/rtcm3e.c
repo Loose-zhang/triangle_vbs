@@ -1998,7 +1998,7 @@ static void gen_msm_sig(rtcm_t *rtcm, int sys, int nsat, int nsig, int ncell,
             if (!(sig=to_sigid(sys,data->code[j]))) continue;
             
             k=sat_ind[sat-1]-1;
-            if ((cell=cell_ind[sig_ind[sig-1]-1+k*nsig])>=64) continue;
+            if ((cell=cell_ind[sig_ind[sig-1]-1+k*nsig])==0||cell>64) continue;
             
             freq=code2freq(sys,data->code[j],fcn-7);
             lambda=freq==0.0?0.0:CLIGHT/freq;
@@ -2049,6 +2049,11 @@ static int encode_msm_head(int type, rtcm_t *rtcm, int sys, int sync, int *nsat,
     }
     /* generate msm satellite, signal and cell index */
     gen_msm_index(rtcm,sys,nsat,&nsig,ncell,sat_ind,sig_ind,cell_ind);
+    if (*nsat*nsig>64) {
+        trace(2,"msm cell mask overflow: type=%d nsat=%d nsig=%d\n",
+              type,*nsat,nsig);
+        return 0;
+    }
     
     if (sys==SYS_GLO) {
         /* GLONASS time (dow + tod-ms) */
