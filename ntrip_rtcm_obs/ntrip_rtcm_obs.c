@@ -71,6 +71,8 @@ typedef int sock_t;
 #define RTCM_OUT_PORT   52000
 #define OUT_VIRT_STAID  2999
 #define MAX_CLIENT_STREAMS 16
+#define VIRT_STATION_INTERVAL 10.0
+#define STREAM_THREAD_STACK_SIZE (8u * 1024u * 1024u)
 
 typedef struct {
     const char *host;
@@ -108,6 +110,8 @@ typedef struct {
 static epoch_snap_t g_epoch_snap[MAX_CLIENT_STREAMS];
 static gtime_t g_last_synth_epoch;
 static int g_have_synth_epoch;
+static gtime_t g_last_station_tx_epoch;
+static int g_have_station_tx_epoch;
 
 static int g_suppress_input_obs;
 static rtcm_t g_enc_rtcm;
@@ -253,7 +257,7 @@ static double norm3diff(const double a[3], const double b[3])
     return sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-/* After each 1005: store ARP; when every stream has ARP, print ECEF midpoint (mean). */
+/* After each 1005/1006: store ARP; when every stream has ARP, print ECEF midpoint (mean). */
 static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worker_t *w)
 {
     int t = last_rtcm3_type(rtcm);
@@ -262,7 +266,7 @@ static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worke
 
     if (g_multi_n < 2)
         return;
-    if (t != 1005)
+    if (t != 1005 && t != 1006)
         return;
 
     k = w->stream_index;
@@ -303,6 +307,7 @@ static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worke
     }
     memcpy(g_last_mid_ecef, mid, sizeof(mid));
     g_have_mid_print = 1;
+    g_have_station_tx_epoch = 0;
 
     ecef2pos(mid, llh);
     printf("\n=== Midpoint (mean ECEF of %d RTCM 1005 ARPs) ===\n", g_multi_n);
@@ -604,6 +609,10 @@ static const struct { int sys; int type; } k_msm7[] = {
 };
 
 #define N_MSM7 (int)(sizeof(k_msm7) / sizeof(k_msm7[0]))
+/* prepare_virt_for_msm7() keeps one signal per satellite, so each MSM chunk can
+ * carry up to 64 satellites. Keep the chunk array bounded; N_MSM7*MAXOBS would
+ * allocate tens of MB on the worker thread stack on macOS. */
+#define MSM_MAX_CHUNKS (N_MSM7 * ((MAXOBS + 63) / 64))
 
 typedef struct {
     int type;
@@ -667,8 +676,8 @@ static void try_synth_virtual_obs(void)
     double P0, P1, Pm_sq, Pm, b, freq, lam, LfromP;
     double mid[3];
     int i0, i1, j, j1, sat, prn, sys;
-    int nv, k, msm_count;
-    msm_chunk_t msm_chunks[N_MSM7 * MAXOBS];
+    int nv, k, msm_count, send_station = 0;
+    msm_chunk_t msm_chunks[MSM_MAX_CHUNKS];
     uint8_t tx_agg[16384];
     int tx_agg_len = 0;
     int dec_obs = 0, dec_sta = 0, dec_err = 0;
@@ -764,15 +773,25 @@ static void try_synth_virtual_obs(void)
     g_enc_rtcm.obs.n = nv;
     memcpy(g_enc_rtcm.obs.data, virt, (size_t)nv * sizeof(obsd_t));
 
-    msm_count = build_msm_chunks(&g_enc_rtcm.obs, msm_chunks,
-                                 (int)(sizeof(msm_chunks) / sizeof(msm_chunks[0])));
+    msm_count = build_msm_chunks(&g_enc_rtcm.obs, msm_chunks, MSM_MAX_CHUNKS);
 
-    if (gen_rtcm3(&g_enc_rtcm, 1005, 0, msm_count > 0 ? 1 : 0)) {
+    if (!g_have_station_tx_epoch) {
+        send_station = 1;
+    }
+    else {
+        double dt = timediff(s0->time, g_last_station_tx_epoch);
+        if (dt >= VIRT_STATION_INTERVAL - 0.5 || dt < -0.5)
+            send_station = 1;
+    }
+
+    if (send_station && gen_rtcm3(&g_enc_rtcm, 1005, 0, 0)) {
         if (tx_agg_len + g_enc_rtcm.nbyte <= (int)sizeof(tx_agg)) {
             memcpy(tx_agg + tx_agg_len, g_enc_rtcm.buff, (size_t)g_enc_rtcm.nbyte);
             tx_agg_len += g_enc_rtcm.nbyte;
         }
         tx_send_buf(g_enc_rtcm.buff, g_enc_rtcm.nbyte);
+        g_last_station_tx_epoch = s0->time;
+        g_have_station_tx_epoch = 1;
     }
 
     for (k = 0; k < msm_count; k++) {
@@ -941,6 +960,7 @@ static void stream_connect_forever(stream_worker_t *w)
         if (g_multi_n > 0 && w->stream_index >= 0 && w->stream_index < g_multi_n) {
             g_arp_valid[w->stream_index] = 0;
             g_have_mid_print = 0;
+            g_have_station_tx_epoch = 0;
             g_epoch_snap[w->stream_index].n = 0;
         }
         printf("[%s] disconnected from %s:%u, reconnecting...\n",
@@ -1042,6 +1062,7 @@ static int run_multi_client(int argc, char **argv)
     g_have_mid_print = 0;
     memset(g_epoch_snap, 0, sizeof(g_epoch_snap));
     g_have_synth_epoch = 0;
+    g_have_station_tx_epoch = 0;
 
     if (!g_enc_inited) {
         if (!init_rtcm(&g_enc_rtcm) || !init_rtcm(&g_dec_rtcm)) {
@@ -1086,8 +1107,7 @@ static int run_multi_client(int argc, char **argv)
 
 #ifdef _WIN32
     for (k = 0; k < n; k++) {
-        /* larger stack for RTCM decode paths (default can be tight on some runtimes) */
-        HANDLE th = CreateThread(NULL, 4u * 1024u * 1024u, stream_thread_proc,
+        HANDLE th = CreateThread(NULL, STREAM_THREAD_STACK_SIZE, stream_thread_proc,
                                  &workers[k], 0, NULL);
         if (!th) {
             fprintf(stderr, "CreateThread failed for stream %d\n", k);
@@ -1105,13 +1125,24 @@ static int run_multi_client(int argc, char **argv)
         Sleep(86400000);
 #else
     {
+        pthread_attr_t attr;
         pthread_t th[MAX_CLIENT_STREAMS];
+        int attr_ok = pthread_attr_init(&attr) == 0;
+
+        if (attr_ok)
+            pthread_attr_setstacksize(&attr, STREAM_THREAD_STACK_SIZE);
+
         for (k = 0; k < n; k++) {
-            if (pthread_create(&th[k], NULL, stream_thread_proc, &workers[k]) != 0) {
+            if (pthread_create(&th[k], attr_ok ? &attr : NULL,
+                               stream_thread_proc, &workers[k]) != 0) {
                 fprintf(stderr, "pthread_create failed for stream %d\n", k);
+                if (attr_ok)
+                    pthread_attr_destroy(&attr);
                 return -1;
             }
         }
+        if (attr_ok)
+            pthread_attr_destroy(&attr);
         for (k = 0; k < n; k++)
             pthread_join(th[k], NULL);
     }
@@ -1128,7 +1159,7 @@ static int listen_loop(unsigned short port, const char *label)
 
     sock_t lfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     struct sockaddr_in addr;
-    rtcm_t rtcm;
+    rtcm_t *rtcm = NULL;
 
     if (lfd == SOCK_INVALID) {
         fprintf(stderr, "socket: failed (%d)\n", sock_errno);
@@ -1156,12 +1187,20 @@ static int listen_loop(unsigned short port, const char *label)
     if (label && label[0]) printf("Stream label: [%s]\n", label);
     fflush(stdout);
 
-    if (!init_rtcm(&rtcm)) {
+    rtcm = (rtcm_t *)calloc(1, sizeof(*rtcm));
+    if (!rtcm) {
         fprintf(stderr, "init_rtcm: out of memory\n");
         sock_close(lfd);
         return -1;
     }
-    rtcm.outtype = 1;
+
+    if (!init_rtcm(rtcm)) {
+        fprintf(stderr, "init_rtcm: out of memory\n");
+        free(rtcm);
+        sock_close(lfd);
+        return -1;
+    }
+    rtcm->outtype = 1;
     tracelevel(0);
 
     for (;;) {
@@ -1174,7 +1213,7 @@ static int listen_loop(unsigned short port, const char *label)
         printf("client connected\n");
         fflush(stdout);
         print_leave();
-        run_client(cfd, &rtcm, label, NULL);
+        run_client(cfd, rtcm, label, NULL);
         print_enter();
         printf("client disconnected\n");
         fflush(stdout);

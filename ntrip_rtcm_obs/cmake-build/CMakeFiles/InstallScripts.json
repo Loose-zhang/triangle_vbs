@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/cmake_install.cmake",
+		"/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/src/cmake_install.cmake",
+		"/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/ntrip_rtcm_obs/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
