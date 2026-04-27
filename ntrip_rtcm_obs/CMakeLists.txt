@@ -1,0 +1,6 @@
+# NTRIP/RTCM3：监听 TCP，用 RTKLIB 解析伪距与载波相位（依赖 src 中的 B2bLib）
+add_executable(ntrip_rtcm_obs ntrip_rtcm_obs.c)
+target_link_libraries(ntrip_rtcm_obs PRIVATE B2bLib)
+if(WIN32)
+    target_compile_definitions(ntrip_rtcm_obs PRIVATE WIN32)
+endif()
