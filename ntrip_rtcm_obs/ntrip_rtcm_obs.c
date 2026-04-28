@@ -3,10 +3,13 @@
  *
  * Usage:
  *   Server (wait for STRSVR to connect in):
- *     ntrip_rtcm_obs [listen_port] [label]
+ *     ntrip_rtcm_obs [-e <eph_host> <eph_port>] [listen_port] [label]
  *       listen_port — default 50001
  *   Client — one or more streams in ONE terminal (each has own decoder + thread):
- *     ntrip_rtcm_obs -c <host> <port> [label] [-c <host> <port> [label] ...]
+ *     ntrip_rtcm_obs [-e <eph_host> <eph_port>] -c <host> <port> [label] ...
+ *       -e : optional extra TCP connection for RTCM3 broadcast ephemeris
+ *            (1019/1020/1042/…). With ephemeris + station ARP, synthetic dual-freq
+ *            P/L use geometry: P ≈ ρ - c·dts (rcv clock 0), L = P·f/c.
  *       Example (two STRSVR servers on 51000 / 51001):
  *         ntrip_rtcm_obs -c 127.0.0.1 51000 BASE_A -c 127.0.0.1 51001 BASE_B
  *       Omit label to auto-use host:port as tag.
@@ -120,6 +123,19 @@ static int g_enc_inited;
 static rtklib_lock_t g_tx_lock;
 static sock_t g_tx_listen = SOCK_INVALID;
 static sock_t g_tx_conn = SOCK_INVALID;
+
+/* Optional TCP RTCM3 ephemeris (broadcast nav); satpos + station -> synthetic P/L */
+static int g_eph_tcp_on;
+static char g_eph_host_buf[256];
+static const char *g_eph_host;
+static unsigned short g_eph_port;
+static rtcm_t g_rtcm_eph;
+static int g_rtcm_eph_inited;
+static rtklib_lock_t g_eph_nav_lock;
+
+/* Receiver ARP (1005/1006) for single-stream / server ephemeris demo print */
+static double g_rcv_ecef[3];
+static int g_rcv_ecef_valid;
 
 static void print_enter(void);
 static void print_leave(void);
@@ -595,6 +611,10 @@ typedef struct {
     obsd_t data[MAXOBS];
 } msm_chunk_t;
 
+static int dual_codes_for_sys(int sys, uint8_t *c0, uint8_t *c1);
+static int synth_pseudorange_from_eph(gtime_t t_rx, const double rr[3], int sat,
+                                      const nav_t *nav, double *P_out);
+
 static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunks)
 {
     int k, i, j, n, ns, nobs, nsig, code, nchunk = 0;
@@ -700,6 +720,28 @@ static void try_synth_virtual_obs(void)
 
         sys = satsys(sat, &prn);
         (void)prn;
+
+        if (g_eph_tcp_on && g_rtcm_eph_inited) {
+            uint8_t c0, c1;
+            double Pg, f0, f1;
+            if (dual_codes_for_sys(sys, &c0, &c1)) {
+                rtklib_lock(&g_eph_nav_lock);
+                if (synth_pseudorange_from_eph(s0->time, mid, sat, &g_rtcm_eph.nav, &Pg)) {
+                    rtklib_unlock(&g_eph_nav_lock);
+                    vd.code[0] = c0;
+                    vd.code[1] = c1;
+                    f0 = code2freq(sys, c0, d0->freq);
+                    f1 = code2freq(sys, c1, d0->freq);
+                    vd.P[0] = vd.P[1] = Pg;
+                    vd.L[0] = (f0 > 0.0) ? Pg * f0 / CLIGHT : 0.0;
+                    vd.L[1] = (f1 > 0.0) ? Pg * f1 / CLIGHT : 0.0;
+                    virt[nv++] = vd;
+                }
+                else
+                    rtklib_unlock(&g_eph_nav_lock);
+            }
+            continue;
+        }
 
         for (j = 0; j < NFREQ + NEXOBS; j++) {
             if (d0->code[j] == CODE_NONE) continue;
@@ -850,6 +892,298 @@ static sock_t tcp_connect_host(const char *host, unsigned short port, int *err)
     return s;
 }
 
+/* Strip [-e host port] from argv; returns new argc. Sets g_eph_tcp_on when present. */
+static int filter_argv_eph(int argc, char **argv)
+{
+    char *keep[80];
+    int i, k = 0;
+
+    g_eph_tcp_on = 0;
+    g_eph_host = NULL;
+    g_eph_port = 0;
+
+    if (argc <= 0 || !argv)
+        return argc;
+    keep[k++] = argv[0];
+    for (i = 1; i < argc;) {
+        if (strcmp(argv[i], "-e") == 0) {
+            int p;
+            if (i + 2 >= argc) {
+                fprintf(stderr, "-e requires <host> <port>\n");
+                exit(1);
+            }
+            if (strlen(argv[i + 1]) >= sizeof(g_eph_host_buf)) {
+                fprintf(stderr, "-e host string too long\n");
+                exit(1);
+            }
+            p = atoi(argv[i + 2]);
+            if (p <= 0 || p >= 65536) {
+                fprintf(stderr, "-e invalid port: %s\n", argv[i + 2]);
+                exit(1);
+            }
+            strncpy(g_eph_host_buf, argv[i + 1], sizeof(g_eph_host_buf) - 1);
+            g_eph_host_buf[sizeof(g_eph_host_buf) - 1] = '\0';
+            g_eph_host = g_eph_host_buf;
+            g_eph_port = (unsigned short)p;
+            g_eph_tcp_on = 1;
+            i += 3;
+            continue;
+        }
+        if (k >= (int)(sizeof(keep) / sizeof(keep[0]))) {
+            fprintf(stderr, "too many arguments\n");
+            exit(1);
+        }
+        keep[k++] = argv[i++];
+    }
+    for (i = 0; i < k; i++)
+        argv[i] = keep[i];
+    return k;
+}
+
+/* MSM7-friendly dual-frequency codes (see rtcm3.c masks).
+ * GPS/QZS: L1 C/A + L5 (not L2). Galileo: E1C + E5aQ. BDS: B1I + B2a.
+ * GLONASS: G1+G2 only (no L5). */
+static int dual_codes_for_sys(int sys, uint8_t *c0, uint8_t *c1)
+{
+    switch (sys) {
+    case SYS_GPS:
+        *c0 = obs2code("1C");
+        *c1 = obs2code("5Q");
+        break;
+    case SYS_GLO:
+        *c0 = obs2code("1C");
+        *c1 = obs2code("2C");
+        break;
+    case SYS_GAL:
+        *c0 = obs2code("1C");
+        *c1 = obs2code("5Q");
+        break;
+    case SYS_QZS:
+        *c0 = obs2code("1C");
+        *c1 = obs2code("5Q");
+        break;
+    case SYS_CMP:
+        *c0 = obs2code("2I");
+        *c1 = obs2code("5X");
+        break;
+    case SYS_IRN: /* MSM7 mask only lists 5A; skip dual here */
+        return 0;
+    default:
+        return 0;
+    }
+    if (*c0 == CODE_NONE || *c1 == CODE_NONE)
+        return 0;
+    return 1;
+}
+
+static const char *eph_synth_band_caption(int sys)
+{
+    if (sys == SYS_GLO)
+        return "G1/G2";
+    if (sys == SYS_CMP)
+        return "B1I/B2a";
+    if (sys == SYS_GAL)
+        return "E1/E5a";
+    return "L1/L5";
+}
+
+/* Geometric pseudorange model (no rcv clock, no iono/tropo): P = ρ - c·dts[0]. */
+static int synth_pseudorange_from_eph(gtime_t t_rx, const double rr[3], int sat,
+                                      const nav_t *nav, double *P_out)
+{
+    double rs[6], dts[2], var, e[3], rho, tau = 0.075;
+    int svh, k;
+
+    for (k = 0; k < 3; k++) {
+        gtime_t t_tx = timeadd(t_rx, -tau);
+        if (!satpos(t_tx, t_rx, sat, EPHOPT_BRDC, nav, rs, dts, &var, &svh))
+            return 0;
+        if (svh < 0)
+            return 0;
+        if ((rho = geodist(rs, rr, e)) <= 0.0)
+            return 0;
+        tau = rho / CLIGHT;
+    }
+    *P_out = rho - CLIGHT * dts[0];
+    return 1;
+}
+
+static void cache_rcv_ecef_from_station_rtcm(const rtcm_t *rtcm)
+{
+    int ty = last_rtcm3_type(rtcm);
+    if (ty == 1005 || ty == 1006) {
+        g_rcv_ecef[0] = rtcm->sta.pos[0];
+        g_rcv_ecef[1] = rtcm->sta.pos[1];
+        g_rcv_ecef[2] = rtcm->sta.pos[2];
+        g_rcv_ecef_valid = 1;
+    }
+}
+
+/* Single-stream / server: print ephemeris-based dual-freq P/L vs ARP. */
+static void print_eph_synth_obs_epoch(const rtcm_t *rtcm, const char *label)
+{
+    char tstr[32], satid[16];
+    int i;
+    uint8_t c0, c1;
+    double Pg, f0, f1;
+    int sys, prn;
+    const char *tag = stream_tag(label);
+
+    if (!g_eph_tcp_on || !g_rtcm_eph_inited || !g_rcv_ecef_valid)
+        return;
+    if (rtcm->obs.n <= 0)
+        return;
+
+    print_enter();
+    time2str(rtcm->obs.data[0].time, tstr, 3);
+    printf("\n[%s] --- eph-synth (dual-freq) epoch %s  n=%d ---\n",
+           tag, tstr, rtcm->obs.n);
+
+    for (i = 0; i < rtcm->obs.n; i++) {
+        const obsd_t *d = &rtcm->obs.data[i];
+        satno2id(d->sat, satid);
+        sys = satsys(d->sat, &prn);
+        (void)prn;
+        if (!dual_codes_for_sys(sys, &c0, &c1))
+            continue;
+        rtklib_lock(&g_eph_nav_lock);
+        if (!synth_pseudorange_from_eph(d->time, g_rcv_ecef, d->sat,
+                                        &g_rtcm_eph.nav, &Pg)) {
+            rtklib_unlock(&g_eph_nav_lock);
+            continue;
+        }
+        rtklib_unlock(&g_eph_nav_lock);
+        f0 = code2freq(sys, c0, d->freq);
+        f1 = code2freq(sys, c1, d->freq);
+        printf("  %-4s  %s  P=%.3f m (geom+brdc clk)  ",
+               satid, eph_synth_band_caption(sys), Pg);
+        if (f0 > 0.0)
+            printf("L_%s=%.6f cyc  ", code2obs(c0), Pg * f0 / CLIGHT);
+        else
+            printf("L_%s=---  ", code2obs(c0));
+        if (f1 > 0.0)
+            printf("L_%s=%.6f cyc\n", code2obs(c1), Pg * f1 / CLIGHT);
+        else
+            printf("L_%s=---\n", code2obs(c1));
+    }
+    fflush(stdout);
+    print_leave();
+}
+
+#ifdef _WIN32
+static DWORD WINAPI eph_stream_thread_proc(LPVOID arg)
+{
+    (void)arg;
+    if (!g_rtcm_eph_inited) {
+        if (!init_rtcm(&g_rtcm_eph)) {
+            fprintf(stderr, "[eph] init_rtcm failed\n");
+            return 0;
+        }
+        g_rtcm_eph.outtype = 1;
+        g_rtcm_eph_inited = 1;
+    }
+    for (;;) {
+        sock_t s;
+        int err;
+        uint8_t buf[4096];
+        int n, i, ret;
+
+        s = tcp_connect_host(g_eph_host, g_eph_port, &err);
+        if (s == SOCK_INVALID) {
+            print_enter();
+            fprintf(stderr, "[eph] connect %s:%u failed (%d), retry 2s\n",
+                    g_eph_host, (unsigned)g_eph_port, err);
+            fflush(stderr);
+            print_leave();
+            Sleep(2000);
+            continue;
+        }
+        print_enter();
+        printf("[eph] connected to %s:%u (broadcast nav)\n",
+               g_eph_host, (unsigned)g_eph_port);
+        fflush(stdout);
+        print_leave();
+        while ((n = (int)recv(s, (char *)buf, (int)sizeof(buf), 0)) > 0) {
+            for (i = 0; i < n; i++) {
+                ret = input_rtcm3(&g_rtcm_eph, buf[i]);
+                (void)ret;
+            }
+        }
+        print_enter();
+        fprintf(stderr, "[eph] disconnected, reconnecting...\n");
+        fflush(stderr);
+        print_leave();
+        sock_close(s);
+    }
+}
+#else
+static void *eph_stream_thread_proc(void *arg)
+{
+    (void)arg;
+    if (!g_rtcm_eph_inited) {
+        if (!init_rtcm(&g_rtcm_eph)) {
+            fprintf(stderr, "[eph] init_rtcm failed\n");
+            return NULL;
+        }
+        g_rtcm_eph.outtype = 1;
+        g_rtcm_eph_inited = 1;
+    }
+    for (;;) {
+        sock_t s;
+        int err;
+        uint8_t buf[4096];
+        int n, i, ret;
+
+        s = tcp_connect_host(g_eph_host, g_eph_port, &err);
+        if (s == SOCK_INVALID) {
+            print_enter();
+            fprintf(stderr, "[eph] connect %s:%u failed (%d), retry 2s\n",
+                    g_eph_host, (unsigned)g_eph_port, err);
+            fflush(stderr);
+            print_leave();
+            sleep(2);
+            continue;
+        }
+        print_enter();
+        printf("[eph] connected to %s:%u (broadcast nav)\n",
+               g_eph_host, (unsigned)g_eph_port);
+        fflush(stdout);
+        print_leave();
+        while ((n = (int)recv(s, (char *)buf, (int)sizeof(buf), 0)) > 0) {
+            for (i = 0; i < n; i++) {
+                ret = input_rtcm3(&g_rtcm_eph, buf[i]);
+                (void)ret;
+            }
+        }
+        print_enter();
+        fprintf(stderr, "[eph] disconnected, reconnecting...\n");
+        fflush(stderr);
+        print_leave();
+        sock_close(s);
+    }
+    return NULL;
+}
+#endif
+
+static void start_eph_receiver_thread(void)
+{
+    if (!g_eph_tcp_on || !g_eph_host)
+        return;
+    rtklib_initlock(&g_eph_nav_lock);
+#ifdef _WIN32
+    if (!CreateThread(NULL, 0, eph_stream_thread_proc, NULL, 0, NULL))
+        fprintf(stderr, "warning: ephemeris TCP thread not started\n");
+#else
+    {
+        pthread_t th;
+        if (pthread_create(&th, NULL, eph_stream_thread_proc, NULL) != 0)
+            fprintf(stderr, "warning: ephemeris TCP thread not started\n");
+        else
+            pthread_detach(th);
+    }
+#endif
+}
+
 /* w_mid non-NULL only in multi-client mode (for 1005/1006 midpoint). */
 static int run_client(sock_t cfd, rtcm_t *rtcm, const char *label, stream_worker_t *w_mid)
 {
@@ -862,6 +1196,8 @@ static int run_client(sock_t cfd, rtcm_t *rtcm, const char *label, stream_worker
             ret = input_rtcm3(rtcm, buf[i]);
             if (ret == 1) {
                 print_obs_epoch(rtcm, label);
+                if (g_eph_tcp_on && g_multi_n < 2)
+                    print_eph_synth_obs_epoch(rtcm, label);
                 if (w_mid != NULL && g_multi_n == 2 && w_mid->stream_index >= 0 &&
                     w_mid->stream_index < MAX_CLIENT_STREAMS) {
                     store_epoch_snapshot(w_mid->stream_index, &rtcm->obs);
@@ -869,6 +1205,7 @@ static int run_client(sock_t cfd, rtcm_t *rtcm, const char *label, stream_worker
                 }
             }
             else if (ret == 5) {
+                cache_rcv_ecef_from_station_rtcm(rtcm);
                 print_station_msg(rtcm, label);
                 if (w_mid != NULL)
                     update_arp_midpoint_from_1005(rtcm, w_mid);
@@ -1020,11 +1357,17 @@ static int run_multi_client(int argc, char **argv)
     }
 
     print_identity_hint();
+    start_eph_receiver_thread();
     printf("Client mode: %d TCP stream(s) in this process.\n", n);
     if (n >= 2) {
         printf("RTCM 1005 ARP from each stream -> midpoint ECEF; input MSM epochs are not printed.\n");
         printf("Synthetic midpoint RTCM (1005 + MSM7) is sent on TCP port %u (one client at a time).\n",
                (unsigned)RTCM_OUT_PORT);
+        if (g_eph_tcp_on)
+            printf("With -e: virtual obs use broadcast ephemeris (dual-freq P/L vs midpoint ARP).\n");
+    }
+    else if (g_eph_tcp_on) {
+        printf("With -e: after 1005/1006 ARP, each printed epoch includes eph-synth dual-freq P/L.\n");
     }
     fflush(stdout);
 
@@ -1156,9 +1499,13 @@ static int listen_loop(unsigned short port, const char *label)
     }
 
     print_identity_hint();
+    start_eph_receiver_thread();
     printf("Listening on TCP port %u - connect STRSVR (or caster) here.\n",
            (unsigned)port);
     if (label && label[0]) printf("Stream label: [%s]\n", label);
+    if (g_eph_tcp_on)
+        printf("Ephemeris TCP: %s:%u (eph-synth lines after ARP)\n",
+               g_eph_host, (unsigned)g_eph_port);
     fflush(stdout);
 
     rtcm = (rtcm_t *)calloc(1, sizeof(*rtcm));
@@ -1200,9 +1547,10 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage:\n"
-            "  ntrip_rtcm_obs [listen_port] [label]     TCP server (default port %d)\n"
-            "  ntrip_rtcm_obs -c <host> <port> [label] [-c <host> <port> [label] ...]\n"
-            "      TCP client(s); multiple -c run in one process (one thread each).\n",
+            "  ntrip_rtcm_obs [-e <eph_host> <eph_port>] [listen_port] [label]\n"
+            "      TCP server (default port %d); optional ephemeris TCP for synth P/L.\n"
+            "  ntrip_rtcm_obs [-e <eph_host> <eph_port>] -c <host> <port> [label] ...\n"
+            "      TCP client(s); -e = RTCM3 nav stream for geometry-based dual-freq obs.\n",
             DEFAULT_PORT);
 }
 
@@ -1210,6 +1558,8 @@ int main(int argc, char **argv)
 {
     unsigned short port = DEFAULT_PORT;
     const char *label = NULL;
+
+    argc = filter_argv_eph(argc, argv);
 
     if (argc >= 2 && strcmp(argv[1], "-c") == 0)
         return run_multi_client(argc, argv) ? 1 : 0;
