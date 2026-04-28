@@ -25,8 +25,8 @@
  *     P_mid = sqrt( max(0, (P_1^2+P_2^2)/2 - b^2/4) )
  *   where P_1,P_2 are the two stations' pseudoranges (used as slant-range proxies;
  *   clock/iono residuals should be small vs. geometry for short baselines).
- *   Carrier cycles derived from that pseudorange only:
- *     L ≈ P_mid / λ   (λ = c/f from signal code; not integer ambiguity)
+ *   Carrier (cycles): mean of both stations only when both have valid phase
+ *   (L≠0); otherwise L=0 even if pseudorange is synthesized.
  *----------------------------------------------------------------------------*/
 #include "rtklib.h"
 #include <stdio.h>
@@ -482,8 +482,11 @@ static void remap_obs_codes_for_msm7(obsd_t *data, int n)
     for (i = 0; i < n; i++) {
         sys = satsys(data[i].sat, &prn);
         for (j = 0; j < NFREQ + NEXOBS; j++) {
+            double L_was;
+
             if (data[i].code[j] == CODE_NONE) continue;
             if (data[i].P[j] == 0.0 && data[i].L[j] == 0.0) continue;
+            L_was = data[i].L[j];
             c = msm_remap_obs_code(sys, data[i].code[j]);
             if (c == CODE_NONE || !obs_code_in_msm_table(sys, c)) {
                 data[i].code[j] = CODE_NONE;
@@ -493,7 +496,7 @@ static void remap_obs_codes_for_msm7(obsd_t *data, int n)
             if (c != data[i].code[j]) {
                 data[i].code[j] = c;
                 fq = code2freq(sys, c, data[i].freq);
-                if (fq > 0.0 && data[i].P[j] != 0.0)
+                if (fq > 0.0 && data[i].P[j] != 0.0 && L_was != 0.0)
                     data[i].L[j] = data[i].P[j] / (CLIGHT / fq);
             }
         }
@@ -641,11 +644,12 @@ static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunk
     return nchunk;
 }
 
-/* Two bases: Apollonius on (P1,P2,b); L from P_mid/λ. Encode RTCM 1005 + MSM7, TCP :52000. */
+/* Two bases: Apollonius on (P1,P2,b); L = mean(L1,L2) only when both phases valid else 0.
+ * Encode RTCM 1005 + MSM7, TCP :52000. */
 static void try_synth_virtual_obs(void)
 {
     const epoch_snap_t *s0 = &g_epoch_snap[0], *s1 = &g_epoch_snap[1];
-    double P0, P1, Pm_sq, Pm, b, freq, lam, LfromP;
+    double P0, P1, Pm_sq, Pm, b;
     double mid[3];
     int i0, i1, j, j1, sat, prn, sys;
     int nv, k, msm_count, send_station = 0;
@@ -711,12 +715,10 @@ static void try_synth_virtual_obs(void)
             if (Pm_sq < 0.0) continue;
             Pm = sqrt(Pm_sq);
 
-            freq = code2freq(sys, d0->code[j], d0->freq);
-            LfromP = (freq > 0.0) ? Pm / (CLIGHT / freq) : 0.0;
-
             vd.code[j] = d0->code[j];
             vd.P[j] = Pm;
-            vd.L[j] = LfromP;
+            vd.L[j] = (d0->L[j] != 0.0 && d1->L[j1] != 0.0)
+                ? 0.5 * (d0->L[j] + d1->L[j1]) : 0.0;
             if (d0->SNR[j] && d1->SNR[j1])
                 vd.SNR[j] = (d0->SNR[j] + d1->SNR[j1]) / 2;
             else
