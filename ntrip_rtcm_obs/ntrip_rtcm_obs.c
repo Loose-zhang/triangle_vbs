@@ -530,34 +530,6 @@ static void cap_rows_per_gnss_sys(obsd_t *data, int n, int max_per_sys)
     }
 }
 
-static void msm_one_signal_per_sat(obsd_t *data, int n)
-{
-    int i, j, prn, sys, jkeep;
-    double sn, snbest;
-
-    for (i = 0; i < n; i++) {
-        sys = satsys(data[i].sat, &prn);
-        jkeep = -1;
-        snbest = -1.0;
-        for (j = 0; j < NFREQ + NEXOBS; j++) {
-            if (data[i].code[j] == CODE_NONE) continue;
-            if (data[i].P[j] <= 0.0 && data[i].L[j] == 0.0) continue;
-            if (!obs_code_in_msm_table(sys, data[i].code[j])) continue;
-            sn = data[i].SNR[j] ? (double)data[i].SNR[j] : 0.0;
-            if (jkeep < 0 || sn > snbest) {
-                jkeep = j;
-                snbest = sn;
-            }
-        }
-        if (jkeep < 0) continue;
-        for (j = 0; j < NFREQ + NEXOBS; j++) {
-            if (j == jkeep) continue;
-            data[i].code[j] = CODE_NONE;
-            data[i].P[j] = data[i].L[j] = 0.0;
-        }
-    }
-}
-
 static int compress_obs_rows(obsd_t *data, int n)
 {
     int w, r, j, has;
@@ -582,7 +554,8 @@ static void prepare_virt_for_msm7(obsd_t *virt, int *pnv)
 {
     remap_obs_codes_for_msm7(virt, *pnv);
     cap_rows_per_gnss_sys(virt, *pnv, MSM_MAX_SATS_PER_SYS);
-    msm_one_signal_per_sat(virt, *pnv);
+    /* Keep all per-frequency slots that passed remap (e.g. dual-frequency for
+     * RTK/PPP). build_msm_chunks() splits by nsat*nsig<=64. */
     *pnv = compress_obs_rows(virt, *pnv);
 }
 
@@ -609,9 +582,8 @@ static const struct { int sys; int type; } k_msm7[] = {
 };
 
 #define N_MSM7 (int)(sizeof(k_msm7) / sizeof(k_msm7[0]))
-/* prepare_virt_for_msm7() keeps one signal per satellite, so each MSM chunk can
- * carry up to 64 satellites. Keep the chunk array bounded; N_MSM7*MAXOBS would
- * allocate tens of MB on the worker thread stack on macOS. */
+/* Chunk count bound: worst case many small MSM pieces when nsig is large;
+ * N_MSM7*MAXOBS alone would allocate tens of MB on the worker thread stack. */
 #define MSM_MAX_CHUNKS (N_MSM7 * ((MAXOBS + 63) / 64))
 
 typedef struct {
