@@ -23,10 +23,12 @@
  * Two streams (-c x2), aligned epochs (|Δt|≤0.5 s), no ephemeris / no sat position:
  *   Apollonius (triangle median length) with baseline b = ||ARP2-ARP1|| from 1005/1006:
  *     P_mid = sqrt( max(0, (P_1^2+P_2^2)/2 - b^2/4) )
- *   where P_1,P_2 are the two stations' pseudoranges (used as slant-range proxies;
- *   clock/iono residuals should be small vs. geometry for short baselines).
- *   Carrier (cycles): mean of both stations only when both have valid phase
- *   (L≠0); otherwise L=0 even if pseudorange is synthesized.
+ *   where P_1,P_2 are the two stations' pseudoranges (slant-range proxies;
+ *   clock/iono residuals small vs. geometry on short baselines).
+ *   Carrier uses the same Apollonius construction per signal directly in cycles:
+ *   convert baseline b to cycles for that signal, keep L_i in cycles, and output
+ *   L_mid in cycles.
+ *   If either station lacks valid L for that signal, L_mid = 0.
  *----------------------------------------------------------------------------*/
 #include "rtklib.h"
 #include <stdio.h>
@@ -644,12 +646,11 @@ static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunk
     return nchunk;
 }
 
-/* Two bases: Apollonius on (P1,P2,b); L = mean(L1,L2) only when both phases valid else 0.
- * Encode RTCM 1005 + MSM7, TCP :52000. */
+/* Two bases: Apollonius on P and on carrier cycles; same b. Encode 1005+MSM7 TCP :52000. */
 static void try_synth_virtual_obs(void)
 {
     const epoch_snap_t *s0 = &g_epoch_snap[0], *s1 = &g_epoch_snap[1];
-    double P0, P1, Pm_sq, Pm, b;
+    double P0, P1, Pm_sq, Pm, b, freq, lam, bcyc, L0, L1, Lm_sq, Lm;
     double mid[3];
     int i0, i1, j, j1, sat, prn, sys;
     int nv, k, msm_count, send_station = 0;
@@ -717,8 +718,19 @@ static void try_synth_virtual_obs(void)
 
             vd.code[j] = d0->code[j];
             vd.P[j] = Pm;
-            vd.L[j] = (d0->L[j] != 0.0 && d1->L[j1] != 0.0)
-                ? 0.5 * (d0->L[j] + d1->L[j1]) : 0.0;
+            vd.L[j] = 0.0;
+            freq = code2freq(sys, d0->code[j], d0->freq);
+            lam = (freq > 0.0) ? CLIGHT / freq : 0.0;
+            if (lam > 0.0 && d0->L[j] != 0.0 && d1->L[j1] != 0.0) {
+                L0 = d0->L[j];
+                L1 = d1->L[j1];
+                bcyc = b / lam;
+                Lm_sq = 0.5 * (L0 * L0 + L1 * L1) - 0.25 * bcyc * bcyc;
+                if (Lm_sq >= 0.0) {
+                    Lm = sqrt(Lm_sq);
+                    vd.L[j] = Lm;
+                }
+            }
             if (d0->SNR[j] && d1->SNR[j1])
                 vd.SNR[j] = (d0->SNR[j] + d1->SNR[j1]) / 2;
             else
