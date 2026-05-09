@@ -1,3 +1,0 @@
-"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\ntrip_rtcm_obs.dir/objects.a
-C:\Users\lenovo\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260407-ucrt-x86_64\bin\llvm-ar.exe qc CMakeFiles\ntrip_rtcm_obs.dir/objects.a @CMakeFiles\ntrip_rtcm_obs.dir\objects1.rsp
-C:\Users\lenovo\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260407-ucrt-x86_64\bin\cc.exe  -Wl,--stack,8388608 -Wl,--whole-archive CMakeFiles\ntrip_rtcm_obs.dir/objects.a -Wl,--no-whole-archive -o ntrip_rtcm_obs.exe -Wl,--out-implib,libntrip_rtcm_obs.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\ntrip_rtcm_obs.dir\linkLibs.rsp

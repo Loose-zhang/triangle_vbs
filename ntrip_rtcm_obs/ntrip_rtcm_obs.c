@@ -746,6 +746,12 @@ static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunk
     return nchunk;
 }
 
+/* Forward declarations for SNR helpers (bodies live further down near
+ * median_of, but Builder A below already needs snr_combine_x1000). */
+static double   snr_to_weight(uint16_t snr_x1000);
+static uint16_t snr_combine_x1000(uint16_t snr_a_x1000, uint16_t snr_b_x1000);
+static int      snr_gate_pass(uint16_t snr_a_x1000, uint16_t snr_b_x1000);
+
 /* ------------------------------------------------------------------------- */
 /* Builder A: legacy Apollonius median formula on P and L (cycles).           */
 /* Used as fallback when broadcast ephemeris is not yet available.            */
@@ -797,9 +803,11 @@ static int build_virt_obs_apollonius(
                 Lm_sq = 0.5 * (L0 * L0 + L1 * L1) - 0.25 * bcyc * bcyc;
                 if (Lm_sq >= 0.0) vd.L[j] = sqrt(Lm_sq);
             }
-            vd.SNR[j] = (d0->SNR[j] && d1->SNR[j1])
-                            ? (uint16_t)((d0->SNR[j] + d1->SNR[j1]) / 2)
-                            : (d0->SNR[j] ? d0->SNR[j] : d1->SNR[j1]);
+            /* Apollonius is a cold-start fallback: keep its observation
+             * combination unchanged (geometric mean), but use the dB-domain
+             * SNR sum so the output value is physically meaningful and
+             * cannot overflow uint16_t. Apollonius does not gate by SNR. */
+            vd.SNR[j] = snr_combine_x1000(d0->SNR[j], d1->SNR[j1]);
             any = 1;
         }
         if (any) virt[nv++] = vd;
@@ -809,18 +817,26 @@ static int build_virt_obs_apollonius(
 }
 
 /* Per-satellite cached geometry for the ephemeris-aware builder.
- * Static under print_lock (try_synth_virtual_obs holds print_lock entire run). */
+ * Static under print_lock (try_synth_virtual_obs holds print_lock entire run).
+ * Indexed by SAT NUMBER directly (sat range 1..MAXSAT) so that union-mode
+ * processing of sats present on only one base works without sat<->index
+ * lookup tables. valid_A / valid_B are independent flags so a single base
+ * outage doesn't invalidate the geometry of the surviving base. */
 typedef struct {
-    int sat;
-    int valid;
-    double dts0;                /* satellite clock bias (s) at signal transmit time */
-    double rho_A, rho_B, rho_V; /* Sagnac-aware geometric ranges */
-    double ion_A, ion_B, ion_V; /* Klobuchar L1 vertical-mapped iono delay (m) */
-    double trp_A, trp_B, trp_V; /* Saastamoinen tropo delay (m) */
-    double elev_A;              /* base-A elevation (rad), used for reference-sat picking */
+    int    valid_A, valid_B;     /* per-base geometry validity (independent) */
+    double dts0;                 /* satellite clock bias (s) at transmit time */
+    double rho_A, rho_B, rho_V;  /* Sagnac-aware geometric ranges (m) */
+    double ion_A, ion_B, ion_V;  /* Klobuchar L1 vertical-mapped iono delay (m) */
+    double trp_A, trp_B, trp_V;  /* Saastamoinen tropo delay (m) */
+    double elev_A, elev_B;       /* per-base elevation (rad) */
 } sat_geom_t;
 
-static sat_geom_t g_geom_cache[MAXOBS];
+static sat_geom_t g_geom_by_sat[MAXSAT + 1];
+
+/* Sat → snapshot-index lookup tables, refilled each epoch.
+ * -1 means the sat is absent from that base's snapshot. */
+static int g_sat_to_iA[MAXSAT + 1];
+static int g_sat_to_iB[MAXSAT + 1];
 
 /* ------------------------------------------------------------------------- */
 /* Phase-side: A-B double-difference integer-ambiguity cache.                 */
@@ -839,6 +855,12 @@ static sat_geom_t g_geom_cache[MAXOBS];
 #define VRS_AMB_FIX_THRES 0.20  /* cycle: round-to-int residual must be below this */
 #define VRS_AMB_KEEP_THRES 0.40 /* cycle: cached fix re-validates if within this */
 
+/* SNR gate: a signal whose either base reports SNR below this is dropped from
+ * BOTH pseudorange and carrier output (and not used to fix DD ambiguities or
+ * to be picked as a reference sat). 25 dBHz is the conventional "below this is
+ * mostly multipath/edge of antenna pattern" floor. obsd_t.SNR is in 0.001 dBHz. */
+#define MIN_SNR_THRES_X1000 25000
+
 typedef struct {
     int    valid;       /* 1 = dd_n is current, 0 = unfixed/invalidated */
     double dd_n;        /* fixed DD integer (cycles), see formula above */
@@ -852,6 +874,51 @@ static amb_cache_t  g_amb[MAXSAT][MAXCODE];
 
 /* Per-epoch QC counters (set by build_virt_obs_with_eph). */
 static int g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch;
+static int g_qc_n_lowsnr;     /* signals dropped because either base SNR < gate */
+static int g_qc_n_p_only_A;   /* sats only on base A: P-only output (DUAL mode) */
+static int g_qc_n_p_only_B;   /* sats only on base B: P-only output (DUAL mode) */
+
+/* ------------------------------------------------------------------------- */
+/* VRS operating mode (epoch-level state machine).                            */
+/*                                                                            */
+/* DUAL  : both bases healthy → existing 2-base ML blend (best precision).    */
+/* A_ONLY: base B is dead → all output synthesized from A only, geometrically */
+/*         shifted to the midpoint V using broadcast ephemeris. Carrier amb.  */
+/*         convention is N_A^k for ALL sats (rover DD stays integer).         */
+/* B_ONLY: symmetric.                                                          */
+/* NONE  : neither base usable → no VRS output (Apollonius fallback also      */
+/*         fails because it needs both bases).                                */
+/*                                                                            */
+/* Mode transitions are gated by hysteresis to prevent RTCM packet-loss-      */
+/* induced thrashing from injecting spurious LLI=1 cycle slips on the rover. */
+/*   DUAL → SINGLE_X: triggered by MODE_FAIL_TO_SINGLE consecutive epochs    */
+/*                    of "other-side has < 4 valid clock sats".              */
+/*   SINGLE_X → DUAL: triggered by MODE_RECOVER_TO_DUAL consecutive good     */
+/*                    epochs (much shorter to react to recoveries).          */
+/*                                                                            */
+/* On each transition (DUAL ↔ SINGLE), the carrier ambiguity convention      */
+/* changes by 0.5*(N_B^j* − N_A^j*) per sat, which the rover sees as a       */
+/* whole-network cycle slip. We force LLI=1 on every output sat in the FIRST */
+/* epoch after the switch, prompting the rover to drop and refresh its      */
+/* ambiguity state cleanly.                                                   */
+/* ------------------------------------------------------------------------- */
+typedef enum {
+    VRS_MODE_NONE = 0,
+    VRS_MODE_DUAL,
+    VRS_MODE_A_ONLY,
+    VRS_MODE_B_ONLY
+} vrs_mode_t;
+
+#define MODE_FAIL_TO_SINGLE  3   /* epochs of side-X-bad before leaving DUAL */
+#define MODE_RECOVER_TO_DUAL 5   /* epochs of side-X-good before re-entering DUAL */
+#define MIN_CLOCK_SATS       4   /* per base, for clock estimation viability */
+
+static vrs_mode_t g_vrs_mode      = VRS_MODE_NONE;
+static int        g_mode_bad_A    = 0;   /* consecutive epochs of "A < MIN_CLOCK_SATS" */
+static int        g_mode_bad_B    = 0;
+static int        g_mode_good_A   = 0;   /* consecutive epochs of "A >= MIN_CLOCK_SATS" */
+static int        g_mode_good_B   = 0;
+static int        g_force_lli_next = 0;  /* set by mode transition; consumed by next synth */
 
 static void init_amb_cache(void)
 {
@@ -870,6 +937,43 @@ static double median_of(double *a, int n)
         a[i + 1] = t;
     }
     return (n & 1) ? a[n / 2] : 0.5 * (a[n / 2 - 1] + a[n / 2]);
+}
+
+/* SNR -> linear-power weight (10^(SNR_dB/10)).
+ * SNR is in 0.001 dBHz (RTKLIB convention). Returns 0 for unknown SNR (=0). */
+static double snr_to_weight(uint16_t snr_x1000)
+{
+    if (!snr_x1000) return 0.0;
+    return pow(10.0, ((double)snr_x1000 * 0.001) * 0.1);
+}
+
+/* Combine two SNRs (both in 0.001 dBHz) into the output SNR of a coherent
+ * sum of two independent signals: 10*log10(P_a + P_b).
+ *   - If only one input has SNR (the other is 0), pass it through.
+ *   - The result is capped at 65.5 dBHz so it always fits uint16_t safely
+ *     (raw addition of two uint16_t SNRs would already be near the limit;
+ *     the dB-domain version makes the cap explicit and physically correct). */
+static uint16_t snr_combine_x1000(uint16_t snr_a_x1000, uint16_t snr_b_x1000)
+{
+    double a_db, b_db, comb_db;
+    if (!snr_a_x1000) return snr_b_x1000;
+    if (!snr_b_x1000) return snr_a_x1000;
+    a_db = (double)snr_a_x1000 * 0.001;
+    b_db = (double)snr_b_x1000 * 0.001;
+    comb_db = 10.0 * log10(pow(10.0, a_db * 0.1) + pow(10.0, b_db * 0.1));
+    if (comb_db > 65.5) comb_db = 65.5;
+    if (comb_db < 0.0) comb_db = 0.0;
+    return (uint16_t)(comb_db * 1000.0 + 0.5);
+}
+
+/* Quick gate: returns 1 iff BOTH SNRs are known and >= MIN_SNR_THRES_X1000.
+ * Returns 1 (permissive) if either SNR is unknown (=0), so streams without
+ * SNR reporting still flow through unchanged. */
+static int snr_gate_pass(uint16_t snr_a_x1000, uint16_t snr_b_x1000)
+{
+    if (snr_a_x1000 > 0 && snr_a_x1000 < MIN_SNR_THRES_X1000) return 0;
+    if (snr_b_x1000 > 0 && snr_b_x1000 < MIN_SNR_THRES_X1000) return 0;
+    return 1;
 }
 
 /* Locate row index in a snapshot for the (sat, code) pair, with valid L on both
@@ -897,22 +1001,38 @@ static int find_obs_idx_with_L(const epoch_snap_t *s0, int i0,
 
 /* Pick the highest-elevation satellite tracked on both bases with a valid L
  * for the given (sys, code). Returns sat number or 0 if none qualifies. */
+/* Pick a reference sat for (sys, code) DD.
+ * Requires: sat present on BOTH s0 AND s1, geometry valid on both bases,
+ *           BOTH bases have valid L on the requested code, and BOTH SNRs
+ *           pass the 25 dBHz gate. Among candidates, takes the one with
+ *           highest elevation (averaged over A/B; on short baselines they
+ *           are within ~0.1°, so this is well-defined).
+ * Used only in DUAL mode; SINGLE_X modes don't need DD ambiguity fixing. */
 static int pick_ref_sat(int sys, uint8_t code,
                         const epoch_snap_t *s0, const epoch_snap_t *s1)
 {
     int best_sat = 0;
     double best_elev = 0.0;
-    int i, prn, dummy_i1, dummy_j1, j;
+    int sat, prn, iA, iB, jB, j;
 
-    for (i = 0; i < s0->n; i++) {
-        const sat_geom_t *g = &g_geom_cache[i];
-        if (!g->valid) continue;
-        if (satsys(g->sat, &prn) != sys) continue;
-        j = find_obs_idx_with_L(s0, i, s1, &dummy_i1, &dummy_j1, code);
+    for (sat = 1; sat <= MAXSAT; sat++) {
+        const sat_geom_t *g = &g_geom_by_sat[sat];
+        double elev;
+        if (!g->valid_A || !g->valid_B) continue;
+        if (satsys(sat, &prn) != sys) continue;
+        iA = g_sat_to_iA[sat];
+        if (iA < 0) continue;
+        j = find_obs_idx_with_L(s0, iA, s1, &iB, &jB, code);
         if (j < 0) continue;
-        if (g->elev_A > best_elev) {
-            best_elev = g->elev_A;
-            best_sat = g->sat;
+        /* Reject as ref any sat whose carrier on either base is below the
+         * SNR gate. A bad ref injects noise into ALL non-ref DD residuals,
+         * so its quality matters disproportionately. Permissive when SNR=0
+         * (unknown) so streams without SNR reporting still produce a ref. */
+        if (!snr_gate_pass(s0->data[iA].SNR[j], s1->data[iB].SNR[jB])) continue;
+        elev = 0.5 * (g->elev_A + g->elev_B);
+        if (elev > best_elev) {
+            best_elev = elev;
+            best_sat  = sat;
         }
     }
     return best_sat;
@@ -996,6 +1116,297 @@ static void transform_amb_on_ref_change(int sys, uint8_t code,
 /* Carrier still uses Apollonius (placeholder until phase upgrade).           */
 /* Returns 1 on success (nv populated), 0 if not enough data/ephemeris.       */
 /* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* Helper: compute per-base geometry into g_geom_by_sat for ONE base.         */
+/*                                                                            */
+/* For each sat present in `snap`:                                            */
+/*   - calls satposs (under g_nav_lock) to get sat ECEF and dts               */
+/*   - computes Sagnac-aware geo range, iono (Klobuchar), tropo (Saast.)      */
+/*     for the base                                                           */
+/*   - on the FIRST base call (caller controls), also fills V's geometry      */
+/*     (rho_V, ion_V, trp_V) using V position, since V geom depends only on   */
+/*     sat position (~1 ppm difference between A's and B's sat-pos estimate, */
+/*     negligible). Subsequent base calls will not overwrite V geometry.     */
+/*                                                                            */
+/* `which` = 'A' or 'B' selects which side to fill. `init_v_geom` should be  */
+/* set on the first call only (idempotent across multiple sats). Returns the */
+/* number of sats with valid geometry on this base.                          */
+/* ------------------------------------------------------------------------- */
+static int compute_geom_for_base(
+    const epoch_snap_t *snap, char which,
+    const double rBase[3], const double rV[3],
+    int init_v_geom)
+{
+    static double rs[6 * MAXOBS];
+    static double dts[2 * MAXOBS];
+    static double var[MAXOBS];
+    static int    svh[MAXOBS];
+    double posBase[3], posV[3], azel[2], e[3];
+    int i, n_valid = 0;
+
+    if (snap->n <= 0) return 0;
+    if (snap->n > MAXOBS) return 0;
+
+    ecef2pos(rBase, posBase);
+    ecef2pos(rV,    posV);
+
+    rtklib_lock(&g_nav_lock);
+    satposs(snap->time, snap->data, snap->n, &g_nav, EPHOPT_BRDC,
+            rs, dts, var, svh);
+
+    for (i = 0; i < snap->n; i++) {
+        const double *r_s = rs + 6 * i;
+        const double *ion_p;
+        int sat = snap->data[i].sat;
+        sat_geom_t *g;
+
+        if (sat <= 0 || sat > MAXSAT) continue;
+        g = &g_geom_by_sat[sat];
+
+        if (svh[i]) continue;
+        if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
+
+        ion_p = (satsys(sat, NULL) == SYS_CMP) ? g_nav.ion_cmp : g_nav.ion_gps;
+
+        {
+            double rho = geodist(r_s, rBase, e);
+            satazel(posBase, e, azel);
+            if (rho <= 0.0 || azel[1] < 5.0 * D2R) continue;
+            if (which == 'A') {
+                g->rho_A  = rho;
+                g->elev_A = azel[1];
+                g->ion_A  = ionmodel(snap->time, ion_p, posBase, azel);
+                g->trp_A  = tropmodel(snap->time, posBase, azel, 0.7);
+                g->valid_A = 1;
+            } else {
+                g->rho_B  = rho;
+                g->elev_B = azel[1];
+                g->ion_B  = ionmodel(snap->time, ion_p, posBase, azel);
+                g->trp_B  = tropmodel(snap->time, posBase, azel, 0.7);
+                g->valid_B = 1;
+            }
+        }
+
+        /* Fill V's geometry on first base that sees this sat. Using A's or B's
+         * sat-pos estimate gives sub-cm difference for V, negligible. */
+        if (init_v_geom &&
+            !((g->rho_V > 0.0))) {
+            double rho_V = geodist(r_s, rV, e);
+            satazel(posV, e, azel);
+            if (rho_V > 0.0) {
+                g->rho_V = rho_V;
+                g->ion_V = ionmodel(snap->time, ion_p, posV, azel);
+                g->trp_V = tropmodel(snap->time, posV, azel, 0.7);
+                g->dts0  = dts[2 * i];
+            }
+        }
+        n_valid++;
+    }
+    rtklib_unlock(&g_nav_lock);
+    return n_valid;
+}
+
+/* Estimate single-base receiver clock (m) via median of per-sat residuals.
+ * Uses the FIRST valid pseudorange of each sat as a robust 1-sample/sat input;
+ * median copes with multipath outliers without per-sat weighting.
+ * `which` selects which base's geometry slot to read.
+ * Returns the number of sats that contributed (n); clock value via *clk_out.
+ * If n < MIN_CLOCK_SATS, *clk_out is set to 0 and the caller should treat
+ * this base as "down" for mode-decision purposes. */
+static int estimate_base_clock(
+    const epoch_snap_t *snap, char which, double *clk_out)
+{
+    static double res[MAXOBS], tmp[MAXOBS];
+    int i, j, n = 0;
+
+    *clk_out = 0.0;
+    if (!snap || snap->n <= 0) return 0;
+
+    for (i = 0; i < snap->n; i++) {
+        const obsd_t *d = &snap->data[i];
+        const sat_geom_t *g;
+        double P = 0.0;
+
+        if (d->sat <= 0 || d->sat > MAXSAT) continue;
+        g = &g_geom_by_sat[d->sat];
+        if (which == 'A' ? !g->valid_A : !g->valid_B) continue;
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            if (d->P[j] > 0.0) { P = d->P[j]; break; }
+        }
+        if (P <= 0.0) continue;
+
+        if (which == 'A')
+            res[n++] = P - g->rho_A + CLIGHT * g->dts0 - g->ion_A - g->trp_A;
+        else
+            res[n++] = P - g->rho_B + CLIGHT * g->dts0 - g->ion_B - g->trp_B;
+    }
+
+    if (n < MIN_CLOCK_SATS) return n;
+    memcpy(tmp, res, (size_t)n * sizeof(double));
+    *clk_out = median_of(tmp, n);
+    return n;
+}
+
+/* Mode state machine — call once per epoch with current health flags.
+ * Updates g_vrs_mode and sets g_force_lli_next on a transition.
+ * `A_healthy`/`B_healthy` should be (n_clock_X >= MIN_CLOCK_SATS). */
+static void update_vrs_mode(int A_healthy, int B_healthy)
+{
+    vrs_mode_t prev = g_vrs_mode;
+    vrs_mode_t target;
+
+    /* Streak counters (one per side, mutually exclusive). */
+    if (A_healthy) { g_mode_good_A++; g_mode_bad_A = 0; }
+    else           { g_mode_bad_A++;  g_mode_good_A = 0; }
+    if (B_healthy) { g_mode_good_B++; g_mode_bad_B = 0; }
+    else           { g_mode_bad_B++;  g_mode_good_B = 0; }
+
+    /* Decide target mode WITHOUT hysteresis (instantaneous best). */
+    if (A_healthy && B_healthy)  target = VRS_MODE_DUAL;
+    else if (A_healthy)          target = VRS_MODE_A_ONLY;
+    else if (B_healthy)          target = VRS_MODE_B_ONLY;
+    else                         target = VRS_MODE_NONE;
+
+    /* Apply hysteresis: only switch AWAY from current mode if the trigger
+     * has held for K consecutive epochs. Switching TO DUAL needs more
+     * confirmation (RECOVER) than switching AWAY from DUAL (FAIL). */
+    if (prev == VRS_MODE_NONE) {
+        /* Cold start: accept any non-NONE mode immediately. */
+        g_vrs_mode = target;
+    }
+    else if (prev == VRS_MODE_DUAL) {
+        if (target == VRS_MODE_A_ONLY && g_mode_bad_B >= MODE_FAIL_TO_SINGLE)
+            g_vrs_mode = VRS_MODE_A_ONLY;
+        else if (target == VRS_MODE_B_ONLY && g_mode_bad_A >= MODE_FAIL_TO_SINGLE)
+            g_vrs_mode = VRS_MODE_B_ONLY;
+        else if (target == VRS_MODE_NONE &&
+                 g_mode_bad_A >= MODE_FAIL_TO_SINGLE &&
+                 g_mode_bad_B >= MODE_FAIL_TO_SINGLE)
+            g_vrs_mode = VRS_MODE_NONE;
+        /* otherwise: stay in DUAL even though one side is briefly down */
+    }
+    else if (prev == VRS_MODE_A_ONLY) {
+        if (target == VRS_MODE_DUAL && g_mode_good_B >= MODE_RECOVER_TO_DUAL)
+            g_vrs_mode = VRS_MODE_DUAL;
+        else if (target == VRS_MODE_NONE && g_mode_bad_A >= MODE_FAIL_TO_SINGLE)
+            g_vrs_mode = VRS_MODE_NONE;
+        else if (target == VRS_MODE_B_ONLY) {
+            /* A died and B alive — direct hand-over (rare, both transitions). */
+            g_vrs_mode = VRS_MODE_B_ONLY;
+        }
+    }
+    else if (prev == VRS_MODE_B_ONLY) {
+        if (target == VRS_MODE_DUAL && g_mode_good_A >= MODE_RECOVER_TO_DUAL)
+            g_vrs_mode = VRS_MODE_DUAL;
+        else if (target == VRS_MODE_NONE && g_mode_bad_B >= MODE_FAIL_TO_SINGLE)
+            g_vrs_mode = VRS_MODE_NONE;
+        else if (target == VRS_MODE_A_ONLY)
+            g_vrs_mode = VRS_MODE_A_ONLY;
+    }
+
+    if (prev != g_vrs_mode && g_vrs_mode != VRS_MODE_NONE)
+        g_force_lli_next = 1;   /* signal cycle-slip on the next emitted epoch */
+}
+
+/* Single-base synthesis: shift `snap`'s observations from base position to V
+ * using broadcast-ephemeris geometry. ALL sats (with valid geometry on this
+ * base) emit BOTH P and L; carrier ambiguity is single-base N_X^k for every
+ * sat, so the rover DD remains integer (different convention from DUAL mode,
+ * which is why a mode transition forces LLI=1 to refix the rover).
+ *
+ *   P_V = P_X + (rho_V - rho_X) + (I_V - I_X) + (T_V - T_X)
+ *   L_V = L_X + (rho_V - rho_X) / lambda          // iono diff < mm on
+ *                                                 // short baselines, ignored
+ *
+ * `clk_X` is unused here (it cancels exactly in the residual form), but is
+ * forwarded to the QC log via the caller. */
+static int build_virt_obs_single(
+    const epoch_snap_t *snap, char which,
+    obsd_t *virt, int *pnv, int force_lli)
+{
+    int i, j, nv = 0, sys, prn, sat;
+    int p_only_counter_inc;
+
+    if (!snap || snap->n <= 0) return 0;
+
+    p_only_counter_inc = 0;  /* SINGLE mode: no "P-only" downgrade — every
+                              * eligible signal outputs P+L; this is just
+                              * to silence unused-var pedantic warnings. */
+    (void)p_only_counter_inc;
+
+    for (i = 0; i < snap->n && nv < MAXOBS; i++) {
+        const obsd_t *d = &snap->data[i];
+        const sat_geom_t *g;
+        obsd_t vd;
+        int any = 0;
+
+        sat = d->sat;
+        if (sat <= 0 || sat > MAXSAT) continue;
+        g = &g_geom_by_sat[sat];
+        if (which == 'A' ? !g->valid_A : !g->valid_B) continue;
+        if (g->rho_V <= 0.0) continue;
+        sys = satsys(sat, &prn); (void)sys; (void)prn;
+
+        memset(&vd, 0, sizeof(vd));
+        vd.time = d->time;
+        vd.sat  = sat;
+        vd.freq = d->freq;
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            double rho_X, ion_X, trp_X;
+
+            if (d->code[j] == CODE_NONE) continue;
+
+            /* SNR floor: same gate as DUAL mode but only on the surviving base. */
+            if (d->SNR[j] > 0 && d->SNR[j] < MIN_SNR_THRES_X1000) {
+                g_qc_n_lowsnr++;
+                continue;
+            }
+
+            if (which == 'A') {
+                rho_X = g->rho_A; ion_X = g->ion_A; trp_X = g->trp_A;
+            } else {
+                rho_X = g->rho_B; ion_X = g->ion_B; trp_X = g->trp_B;
+            }
+
+            /* Pseudorange */
+            if (d->P[j] > 0.0) {
+                vd.code[j] = d->code[j];
+                vd.P[j] = d->P[j] + (g->rho_V - rho_X)
+                                  + (g->ion_V - ion_X)
+                                  + (g->trp_V - trp_X);
+                vd.SNR[j] = d->SNR[j];
+                /* In SINGLE mode "snr_combine" with a single source equals
+                 * the source itself. No need to call snr_combine_x1000. */
+                any = 1;
+            }
+
+            /* Carrier — pure geometric shift. Iono difference on phase has
+             * opposite sign vs code; on short baselines (≤ a few km) the
+             * I_V−I_X term is < 1 mm, well below carrier noise — we omit it
+             * for the same reason the DUAL path does. */
+            if (d->L[j] != 0.0) {
+                double freq = code2freq(sys, d->code[j], d->freq);
+                double lam  = (freq > 0.0) ? CLIGHT / freq : 0.0;
+                if (lam > 0.0) {
+                    vd.L[j]   = d->L[j] + (g->rho_V - rho_X) / lam;
+                    if (vd.code[j] == 0) vd.code[j] = d->code[j];
+                    /* Inherit cycle-slip flag from source AND inject LLI=1
+                     * on the first epoch of a mode transition. */
+                    vd.LLI[j] = (uint8_t)((d->LLI[j] | (force_lli ? 1 : 0)) & 0xFF);
+                    any = 1;
+                    g_qc_n_fix++;  /* "single-base fix" — count as fix in QC */
+                }
+            }
+        }
+        if (any) virt[nv++] = vd;
+    }
+
+    *pnv = nv;
+    return nv > 0 ? 1 : 0;
+}
+
 static int build_virt_obs_with_eph(
     const epoch_snap_t *s0, const epoch_snap_t *s1,
     const double rA[3], const double rB[3], const double rV[3],
@@ -1004,109 +1415,89 @@ static int build_virt_obs_with_eph(
     int *nclk_A_out, int *nclk_B_out,
     double *rms_eps_out)
 {
-    static double rs[6 * MAXOBS];
-    static double dts[2 * MAXOBS];
-    static double var[MAXOBS];
-    static int    svh[MAXOBS];
-    static double res_A[MAXOBS], res_B[MAXOBS];
-    static double tmp[MAXOBS];
-
-    double posA[3], posB[3], posV[3];
-    double e[3];
     double clk_A = 0.0, clk_B = 0.0, clk_V;
     double sum_dd2 = 0.0;
     int n_dd = 0;
     int n_res_A = 0, n_res_B = 0;
-    int i0, i1, j, j1, sat, sys, prn, nv = 0;
-    double b = norm3diff(rA, rB);
-    double azel[2];
+    int i, i0, i1, j, j1, sat, sys, prn, nv = 0;
+    int A_healthy, B_healthy;
+    int force_lli;
 
     if (!g_nav_inited) return 0;
-    if (s0->n <= 0 || s1->n <= 0) return 0;
-    if (s0->n > MAXOBS) return 0;
+    if (s0->n <= 0 && s1->n <= 0) return 0;     /* both bases empty */
+    if (s0->n > MAXOBS || s1->n > MAXOBS) return 0;
 
-    ecef2pos(rA, posA);
-    ecef2pos(rB, posB);
-    ecef2pos(rV, posV);
-
-    /* satposs handles transit-time iteration; needs P[0] or first valid P. */
-    rtklib_lock(&g_nav_lock);
-    satposs(s0->time, s0->data, s0->n, &g_nav, EPHOPT_BRDC, rs, dts, var, svh);
-
-    for (i0 = 0; i0 < s0->n; i0++) {
-        const double *r_s = rs + 6 * i0;
-        const double *ion_p;
-        sat_geom_t *g = &g_geom_cache[i0];
-        g->valid = 0;
-        g->sat = s0->data[i0].sat;
-        if (svh[i0]) continue;
-        if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
-
-        g->rho_A = geodist(r_s, rA, e); satazel(posA, e, azel);
-        if (g->rho_A <= 0.0 || azel[1] < 5.0 * D2R) continue;
-        g->elev_A = azel[1];
-        g->ion_A = ionmodel(s0->time, g_nav.ion_gps, posA, azel);
-        g->trp_A = tropmodel(s0->time, posA, azel, 0.7);
-        if (satsys(g->sat, NULL) == SYS_CMP)
-            g->ion_A = ionmodel(s0->time, g_nav.ion_cmp, posA, azel);
-
-        g->rho_B = geodist(r_s, rB, e); satazel(posB, e, azel);
-        if (g->rho_B <= 0.0 || azel[1] < 5.0 * D2R) continue;
-        ion_p = (satsys(g->sat, NULL) == SYS_CMP) ? g_nav.ion_cmp : g_nav.ion_gps;
-        g->ion_B = ionmodel(s0->time, ion_p, posB, azel);
-        g->trp_B = tropmodel(s0->time, posB, azel, 0.7);
-
-        g->rho_V = geodist(r_s, rV, e); satazel(posV, e, azel);
-        if (g->rho_V <= 0.0) continue;
-        g->ion_V = ionmodel(s0->time, ion_p, posV, azel);
-        g->trp_V = tropmodel(s0->time, posV, azel, 0.7);
-
-        g->dts0 = dts[2 * i0];
-        g->valid = 1;
+    /* ----- Reset sat-keyed geometry & sat→snap-index lookup tables ----- */
+    for (i = 0; i <= MAXSAT; i++) {
+        g_geom_by_sat[i].valid_A = 0;
+        g_geom_by_sat[i].valid_B = 0;
+        g_geom_by_sat[i].rho_V   = 0.0;
+        g_sat_to_iA[i] = -1;
+        g_sat_to_iB[i] = -1;
     }
-    rtklib_unlock(&g_nav_lock);
-
-    /* Pass 1: per-sat clock residuals using each base's first valid P. */
-    for (i0 = 0; i0 < s0->n; i0++) {
-        const obsd_t *d0 = &s0->data[i0];
-        const obsd_t *d1;
-        const sat_geom_t *g = &g_geom_cache[i0];
-        double P0 = 0.0, P1 = 0.0;
-
-        if (!g->valid) continue;
-        i1 = find_sat_in_snap(s1, d0->sat);
-        if (i1 < 0) continue;
-        d1 = &s1->data[i1];
-
-        for (j = 0; j < NFREQ + NEXOBS; j++) {
-            if (P0 == 0.0 && d0->P[j] > 0.0) P0 = d0->P[j];
-            if (P1 == 0.0 && d1->P[j] > 0.0) P1 = d1->P[j];
-            if (P0 != 0.0 && P1 != 0.0) break;
-        }
-        if (P0 > 0.0)
-            res_A[n_res_A++] = P0 - g->rho_A + CLIGHT * g->dts0 - g->ion_A - g->trp_A;
-        if (P1 > 0.0)
-            res_B[n_res_B++] = P1 - g->rho_B + CLIGHT * g->dts0 - g->ion_B - g->trp_B;
+    for (i = 0; i < s0->n; i++) {
+        int s = s0->data[i].sat;
+        if (s > 0 && s <= MAXSAT) g_sat_to_iA[s] = i;
     }
-    if (n_res_A < 4 || n_res_B < 4) return 0;
+    for (i = 0; i < s1->n; i++) {
+        int s = s1->data[i].sat;
+        if (s > 0 && s <= MAXSAT) g_sat_to_iB[s] = i;
+    }
 
-    memcpy(tmp, res_A, (size_t)n_res_A * sizeof(double));
-    clk_A = median_of(tmp, n_res_A);
-    memcpy(tmp, res_B, (size_t)n_res_B * sizeof(double));
-    clk_B = median_of(tmp, n_res_B);
+    /* ----- Per-base geometry passes (independent; either may be empty) ----- */
+    if (s0->n > 0) compute_geom_for_base(s0, 'A', rA, rV, /*init_v_geom=*/1);
+    if (s1->n > 0) compute_geom_for_base(s1, 'B', rB, rV, /*init_v_geom=*/1);
+
+    /* ----- Independent clock estimation per base ----- */
+    n_res_A = estimate_base_clock(s0, 'A', &clk_A);
+    n_res_B = estimate_base_clock(s1, 'B', &clk_B);
+
+    A_healthy = (n_res_A >= MIN_CLOCK_SATS);
+    B_healthy = (n_res_B >= MIN_CLOCK_SATS);
+
+    /* ----- Mode state machine ----- */
+    update_vrs_mode(A_healthy, B_healthy);
+    force_lli = g_force_lli_next;
+    g_force_lli_next = 0;
+
+    /* ----- Out-parameter prep (so QC log shows clock+counts even if NONE) -- */
+    if (clk_A_out)   *clk_A_out   = clk_A;
+    if (clk_B_out)   *clk_B_out   = clk_B;
+    if (nclk_A_out)  *nclk_A_out  = n_res_A;
+    if (nclk_B_out)  *nclk_B_out  = n_res_B;
+    if (rms_eps_out) *rms_eps_out = 0.0;
+    *pnv = 0;
+
+    /* ----- Dispatch by mode ----- */
+    if (g_vrs_mode == VRS_MODE_NONE) return 0;
+
+    if (g_vrs_mode == VRS_MODE_A_ONLY) {
+        return build_virt_obs_single(s0, 'A', virt, pnv, force_lli);
+    }
+    if (g_vrs_mode == VRS_MODE_B_ONLY) {
+        return build_virt_obs_single(s1, 'B', virt, pnv, force_lli);
+    }
+
+    /* ===== DUAL mode below: union iteration with full DD ambiguity fixing == */
     clk_V = 0.5 * (clk_A + clk_B);
 
-    /* ----- Pass 2a: pre-scan codes seen this epoch and refresh ref sats ---- */
+    /* ----- Pass 2a: pre-scan codes seen this epoch and refresh ref sats ----
+     * Only sats present on BOTH bases (with valid_A && valid_B) can act as
+     * a DD reference, so we scan exactly those. */
     {
         int seen_sys_code[7][MAXCODE];   /* track which (sys, code) appeared */
         int sysmap[7] = {SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_SBS, SYS_CMP, SYS_IRN};
-        int si, ci;
+        int si, ci, s_iter;
         memset(seen_sys_code, 0, sizeof(seen_sys_code));
-        for (i0 = 0; i0 < s0->n; i0++) {
-            const obsd_t *d0 = &s0->data[i0];
-            int sb;
-            if (!g_geom_cache[i0].valid) continue;
-            sb = sys_bit_index(satsys(d0->sat, &prn));
+        for (s_iter = 1; s_iter <= MAXSAT; s_iter++) {
+            const sat_geom_t *g_chk = &g_geom_by_sat[s_iter];
+            const obsd_t *d0;
+            int iA, sb;
+            if (!g_chk->valid_A || !g_chk->valid_B) continue;
+            iA = g_sat_to_iA[s_iter];
+            if (iA < 0) continue;
+            d0 = &s0->data[iA];
+            sb = sys_bit_index(satsys(s_iter, &prn));
             if (sb < 0) continue;
             for (j = 0; j < NFREQ + NEXOBS; j++) {
                 if (d0->code[j] == CODE_NONE) continue;
@@ -1118,20 +1509,18 @@ static int build_virt_obs_with_eph(
             for (ci = 0; ci < MAXCODE; ci++) {
                 int old_ref, cand_ref;
                 int old_still_visible;
-                int dummy_i1, dummy_j1;
+                int dummy_i1, dummy_j1, iA;
                 if (!seen_sys_code[si][ci]) continue;
                 old_ref = g_ref_sat[si][ci];
                 old_still_visible = 0;
-                if (old_ref > 0 && old_ref <= MAXSAT) {
-                    /* Find old_ref in s0 and verify both bases see L on this code */
-                    for (i0 = 0; i0 < s0->n; i0++) {
-                        if (s0->data[i0].sat != old_ref) continue;
-                        if (!g_geom_cache[i0].valid) break;
-                        if (find_obs_idx_with_L(s0, i0, s1, &dummy_i1, &dummy_j1,
-                                                (uint8_t)(ci + 1)) >= 0)
-                            old_still_visible = 1;
-                        break;
-                    }
+                if (old_ref > 0 && old_ref <= MAXSAT &&
+                    g_geom_by_sat[old_ref].valid_A &&
+                    g_geom_by_sat[old_ref].valid_B) {
+                    iA = g_sat_to_iA[old_ref];
+                    if (iA >= 0 &&
+                        find_obs_idx_with_L(s0, iA, s1, &dummy_i1, &dummy_j1,
+                                            (uint8_t)(ci + 1)) >= 0)
+                        old_still_visible = 1;
                 }
                 if (old_still_visible) continue;   /* keep current ref */
 
@@ -1156,33 +1545,85 @@ static int build_virt_obs_with_eph(
         }
     }
 
-    /* ----- Pass 2b: cache per-(sat,code) ref-sat geometry for DD ----------- */
-    /* For each (sys, code) we need rho_A^ref, rho_B^ref, L_A^ref, L_B^ref.   */
-    /* Fast path: index sat -> i0_in_s0. */
+    /* ----- Pass 2b: union-mode synthesis ------------------------------------
+     * Iterate over every sat that is present on AT LEAST one base. Three
+     * branches per sat:
+     *   (a) sat on both bases    → 2-base ML blend (existing logic)
+     *   (b) sat on A only         → P-only, geometric shift to V (no L, to
+     *                               keep all output L on the same DUAL ambig
+     *                               convention so rover DD stays integer)
+     *   (c) sat on B only         → P-only, symmetric
+     * For (a) we follow the per-signal SNR gate / ML-weighted blend / DD-fix
+     * pipeline. For (b)/(c) we just compute P_V via residual-form on the
+     * surviving base (ε_X mathematically the same as in single-base mode).
+     * --------------------------------------------------------------------- */
     {
-        static int sat_to_i0[MAXSAT + 1];
-        memset(sat_to_i0, -1, sizeof(sat_to_i0));
-        for (i0 = 0; i0 < s0->n; i0++)
-            if (s0->data[i0].sat > 0 && s0->data[i0].sat <= MAXSAT)
-                sat_to_i0[s0->data[i0].sat] = i0;
-
-        for (i0 = 0; i0 < s0->n && nv < MAXOBS; i0++) {
-            const obsd_t *d0 = &s0->data[i0];
-            const obsd_t *d1;
-            const sat_geom_t *g = &g_geom_cache[i0];
+        int sat_iter;
+        for (sat_iter = 1; sat_iter <= MAXSAT && nv < MAXOBS; sat_iter++) {
+            const sat_geom_t *g = &g_geom_by_sat[sat_iter];
+            const obsd_t *d0 = NULL, *d1 = NULL;
             obsd_t vd;
-            int any = 0;
-            int sb;
+            int any = 0, sb;
             double freq, lam;
+            int branch;     /* 0 = both, 1 = A-only, 2 = B-only */
 
-            if (!g->valid) continue;
-            i1 = find_sat_in_snap(s1, d0->sat);
-            if (i1 < 0) continue;
-            d1 = &s1->data[i1];
-            sat = d0->sat;
+            if (!g->valid_A && !g->valid_B) continue;
+            if (g->rho_V <= 0.0) continue;
+
+            i0 = g_sat_to_iA[sat_iter];
+            i1 = g_sat_to_iB[sat_iter];
+
+            if (g->valid_A && g->valid_B && i0 >= 0 && i1 >= 0) {
+                branch = 0;
+                d0 = &s0->data[i0];
+                d1 = &s1->data[i1];
+            } else if (g->valid_A && i0 >= 0) {
+                branch = 1;
+                d0 = &s0->data[i0];
+            } else if (g->valid_B && i1 >= 0) {
+                branch = 2;
+                d1 = &s1->data[i1];
+            } else continue;
+
+            sat = sat_iter;
             sys = satsys(sat, &prn); (void)prn;
             sb = sys_bit_index(sys);
             if (sb < 0) continue;
+
+            memset(&vd, 0, sizeof(vd));
+            vd.time = (branch == 2) ? d1->time : d0->time;
+            vd.sat  = sat;
+            vd.freq = (branch == 2) ? d1->freq : d0->freq;
+
+            /* ===== Branch (b)/(c): single-base P-only, then continue ====== */
+            if (branch != 0) {
+                const obsd_t *d   = (branch == 1) ? d0 : d1;
+                double rho_X = (branch == 1) ? g->rho_A : g->rho_B;
+                double ion_X = (branch == 1) ? g->ion_A : g->ion_B;
+                double trp_X = (branch == 1) ? g->trp_A : g->trp_B;
+                for (j = 0; j < NFREQ + NEXOBS; j++) {
+                    if (d->code[j] == CODE_NONE) continue;
+                    if (d->P[j] <= 0.0) continue;
+                    if (d->SNR[j] > 0 && d->SNR[j] < MIN_SNR_THRES_X1000) {
+                        g_qc_n_lowsnr++;
+                        continue;
+                    }
+                    vd.code[j] = d->code[j];
+                    vd.P[j]    = d->P[j] + (g->rho_V - rho_X)
+                                          + (g->ion_V - ion_X)
+                                          + (g->trp_V - trp_X);
+                    vd.SNR[j]  = d->SNR[j];
+                    /* Carrier intentionally not emitted on single-base sats
+                     * in DUAL mode — see the long comment in the carrier
+                     * branch below. */
+                    if (branch == 1) g_qc_n_p_only_A++;
+                    else             g_qc_n_p_only_B++;
+                    any = 1;
+                }
+                if (any) virt[nv++] = vd;
+                continue;
+            }
+            /* ===== Branch (a): both bases present, full 2-base pipeline === */
 
             memset(&vd, 0, sizeof(vd));
             vd.time = d0->time;
@@ -1191,12 +1632,34 @@ static int build_virt_obs_with_eph(
 
             for (j = 0; j < NFREQ + NEXOBS; j++) {
                 double eps_A, eps_B, Pv;
+                double w_A, w_B, w_sum;
                 if (d0->code[j] == CODE_NONE) continue;
                 j1 = find_same_code_idx(d1, d0->code[j]);
                 if (j1 < 0) continue;
 
-                /* ----- Pseudorange path (unchanged from previous version) ----- */
+                /* ----- SNR gate (applies to BOTH P and L outputs) -----
+                 * If either base reports SNR below MIN_SNR_THRES_X1000, this
+                 * signal is dropped from the VRS entirely. Permissive when
+                 * SNR is unknown (=0) so streams without SNR reporting still
+                 * flow through. */
+                if (!snr_gate_pass(d0->SNR[j], d1->SNR[j1])) {
+                    g_qc_n_lowsnr++;
+                    continue;
+                }
+
+                /* SNR-derived linear-power weights for ε combination. */
+                w_A = snr_to_weight(d0->SNR[j]);
+                w_B = snr_to_weight(d1->SNR[j1]);
+                w_sum = w_A + w_B;
+
+                /* ----- Pseudorange path: SNR-weighted residual blend -----
+                 * clk_V is the *epoch-level* receiver clock = mean of clk_A,
+                 * clk_B (set in pass 1) and is the same across signals; only
+                 * the per-signal residuals (ε_A, ε_B) are SNR-blended. The
+                 * blend asymptotically becomes max-likelihood when σ ∝
+                 * 1/sqrt(C/N0). */
                 if (d0->P[j] > 0.0 && d1->P[j1] > 0.0) {
+                    double w_eps;
                     eps_A = d0->P[j]   - g->rho_A + CLIGHT * g->dts0
                           - g->ion_A - g->trp_A - clk_A;
                     eps_B = d1->P[j1]  - g->rho_B + CLIGHT * g->dts0
@@ -1207,13 +1670,16 @@ static int build_virt_obs_with_eph(
                     }
                     sum_dd2 += (eps_A - eps_B) * (eps_A - eps_B);
                     n_dd++;
-                    Pv = g->rho_V - CLIGHT * g->dts0 + g->ion_V + g->trp_V + clk_V
-                       + 0.5 * (eps_A + eps_B);
+                    /* Equal-weight fallback if both SNRs are unknown (=0). */
+                    w_eps = (w_sum > 0.0) ? (w_A * eps_A + w_B * eps_B) / w_sum
+                                          : 0.5 * (eps_A + eps_B);
+                    Pv = g->rho_V - CLIGHT * g->dts0 + g->ion_V + g->trp_V
+                       + clk_V + w_eps;
                     vd.code[j] = d0->code[j];
                     vd.P[j] = Pv;
-                    vd.SNR[j] = (d0->SNR[j] && d1->SNR[j1])
-                                    ? (uint16_t)((d0->SNR[j] + d1->SNR[j1]) / 2)
-                                    : (d0->SNR[j] ? d0->SNR[j] : d1->SNR[j1]);
+                    /* Output SNR: physical-power sum, not arithmetic average.
+                     * Capped inside snr_combine_x1000 to fit uint16_t. */
+                    vd.SNR[j] = snr_combine_x1000(d0->SNR[j], d1->SNR[j1]);
                     any = 1;
                 }
                 else {
@@ -1235,9 +1701,9 @@ static int build_virt_obs_with_eph(
                 {
                     int ci = (int)d0->code[j] - 1;
                     int ref_sat = g_ref_sat[sb][ci];
-                    int ref_i0;
+                    int ref_iA;
                     int ref_j0_idx, ref_j1_idx;
-                    int ref_i1;
+                    int ref_iB;
                     amb_cache_t *a = &g_amb[sat - 1][ci];
                     int slip = ((d0->LLI[j] | d1->LLI[j1]) & 1);
 
@@ -1246,28 +1712,30 @@ static int build_virt_obs_with_eph(
                         g_qc_n_drop++;
                         continue;
                     }
-                    ref_i0 = sat_to_i0[ref_sat];
-                    if (ref_i0 < 0 || !g_geom_cache[ref_i0].valid) {
+                    ref_iA = g_sat_to_iA[ref_sat];
+                    if (ref_iA < 0 ||
+                        !g_geom_by_sat[ref_sat].valid_A ||
+                        !g_geom_by_sat[ref_sat].valid_B) {
                         g_qc_n_drop++;
                         continue;
                     }
                     /* Locate ref sat's L on both bases for THIS code */
-                    if (find_obs_idx_with_L(s0, ref_i0, s1, &ref_i1, &ref_j1_idx,
+                    if (find_obs_idx_with_L(s0, ref_iA, s1, &ref_iB, &ref_j1_idx,
                                             d0->code[j]) < 0) {
                         g_qc_n_drop++;
                         continue;
                     }
                     /* Get the L slot index on s0 for ref */
                     for (ref_j0_idx = 0; ref_j0_idx < NFREQ + NEXOBS; ref_j0_idx++) {
-                        if (s0->data[ref_i0].code[ref_j0_idx] == d0->code[j] &&
-                            s0->data[ref_i0].L[ref_j0_idx] != 0.0) break;
+                        if (s0->data[ref_iA].code[ref_j0_idx] == d0->code[j] &&
+                            s0->data[ref_iA].L[ref_j0_idx] != 0.0) break;
                     }
                     if (ref_j0_idx >= NFREQ + NEXOBS) { g_qc_n_drop++; continue; }
 
                     {
-                        const obsd_t *r0 = &s0->data[ref_i0];
-                        const obsd_t *r1 = &s1->data[ref_i1];
-                        const sat_geom_t *gr = &g_geom_cache[ref_i0];
+                        const obsd_t *r0 = &s0->data[ref_iA];
+                        const obsd_t *r1 = &s1->data[ref_iB];
+                        const sat_geom_t *gr = &g_geom_by_sat[ref_sat];
                         double dd_geom_cyc, dd_float, dd_n_round, dd_resid;
                         double L_B_aligned, L_A_at_V, L_B_at_V, L_V_avg;
                         int slip_ref = ((r0->LLI[ref_j0_idx] | r1->LLI[ref_j1_idx]) & 1);
@@ -1322,15 +1790,28 @@ static int build_virt_obs_with_eph(
                          * L_B is realigned to base-A's reference frame using DD_n;
                          * (clk_A - clk_B) does NOT need to be subtracted because
                          * its noise (~1.5 cyc on B1I) would dominate carrier noise.
-                         * The resulting L_V has effective ambig
+                         *
+                         * IMPORTANT — equal weights here are deliberate:
+                         * the resulting L_V has effective ambig
                          *   N_A^k + 0.5 * (N_B^ref - N_A^ref)
-                         * which is the same half-integer offset for ALL sats and
-                         * ALL epochs (until ref switch); so rover DD stays integer. */
+                         * which is the SAME half-integer offset for all sats
+                         * (and all epochs until ref switch), so the rover DD
+                         * stays integer. If we used SNR-weights w_A, w_B the
+                         * offset would become w_B/(w_A+w_B)*(N_B^ref - N_A^ref)
+                         * — a per-signal value — and DD would no longer be
+                         * integer. Carrier noise on signals that pass the
+                         * 25 dBHz gate is ≤ a few mm anyway, so the noise
+                         * loss from equal-weighting is negligible compared
+                         * to losing integer ambiguities at the rover. */
                         L_B_aligned = d1->L[j1] + a->dd_n;
                         L_A_at_V    = d0->L[j]  + (g->rho_V - g->rho_A) / lam;
                         L_B_at_V    = L_B_aligned + (g->rho_V - g->rho_B) / lam;
                         L_V_avg     = 0.5 * (L_A_at_V + L_B_at_V);
                         vd.L[j] = L_V_avg;
+                        /* Inherit cycle-slip flags AND inject LLI=1 on the
+                         * first epoch after a SINGLE↔DUAL mode transition. */
+                        vd.LLI[j] = (uint8_t)((d0->LLI[j] | d1->LLI[j1]
+                                              | (force_lli ? 1 : 0)) & 0xFF);
                         g_qc_n_fix++;
                     }
                 }
@@ -1340,12 +1821,10 @@ static int build_virt_obs_with_eph(
     }
 
     *pnv = nv;
-    if (clk_A_out)    *clk_A_out    = clk_A;
-    if (clk_B_out)    *clk_B_out    = clk_B;
-    if (nclk_A_out)   *nclk_A_out   = n_res_A;
-    if (nclk_B_out)   *nclk_B_out   = n_res_B;
+    /* clk_X_out / nclk_X_out / *pnv already populated above (kept for callers
+     * that read these even when we early-returned). Just refresh rms_eps. */
     if (rms_eps_out)  *rms_eps_out  = (n_dd > 0) ? sqrt(sum_dd2 / n_dd) * 0.5 : 0.0;
-    return 1;
+    return nv > 0 ? 1 : 0;
 }
 
 /* Two bases: ephemeris path (clock-corrected average) preferred, Apollonius fallback. */
@@ -1365,21 +1844,54 @@ static void try_synth_virtual_obs(void)
 
     if (g_base_n != 2) return;
     if (!g_enc_inited) return;
-    if (s0->n <= 0 || s1->n <= 0) return;
-    if (fabs(timediff(s0->time, s1->time)) > 0.5) return;
-    if (!g_arp_valid[0] || !g_arp_valid[1]) return;
+    /* Allow single-base operation: at least ONE base must have data. The
+     * mode state machine inside build_virt_obs_with_eph decides whether to
+     * stay in DUAL or fall to SINGLE_X based on hysteresis-protected health
+     * of each base. The "both ARPs known" requirement remains because we
+     * still want to anchor the VRS at the geometric midpoint regardless of
+     * which base is currently producing observations. */
+    if (s0->n <= 0 && s1->n <= 0) return;
+    if (s0->n > 0 && s1->n > 0 &&
+        fabs(timediff(s0->time, s1->time)) > 0.5) return;
+    /* ARP gate. If we never saw one base's 1005 (typical: it died before its
+     * first heartbeat), we cannot place V at the midpoint. Emit a one-shot
+     * diagnostic so the user understands why VRS is silent — otherwise it
+     * looks like the program just hung. */
+    if (!g_arp_valid[0] || !g_arp_valid[1]) {
+        static int warned = 0;
+        if (!warned) {
+            print_enter();
+            printf("VRS [waiting]: base %s ARP not yet received "
+                   "(have_A=%d have_B=%d). Cannot compute midpoint V; will "
+                   "stay silent until both 1005/1006 messages arrive.\n",
+                   (!g_arp_valid[0] && !g_arp_valid[1]) ? "A and B" :
+                   (!g_arp_valid[0] ? "A" : "B"),
+                   g_arp_valid[0], g_arp_valid[1]);
+            fflush(stdout);
+            print_leave();
+            warned = 1;
+        }
+        return;
+    }
 
     b = norm3diff(g_arp_ecef[1], g_arp_ecef[0]);
     if (b <= 0.0) return;
 
     print_enter();
 
-    if (g_have_synth_epoch && fabs(timediff(s0->time, g_last_synth_epoch)) < 0.95) {
-        print_leave();
-        return;
+    /* Choose the active epoch timestamp. In SINGLE_X mode one snap may be
+     * empty; pick the surviving side. */
+    {
+        gtime_t t_epoch = (s0->n > 0) ? s0->time : s1->time;
+
+        if (g_have_synth_epoch &&
+            fabs(timediff(t_epoch, g_last_synth_epoch)) < 0.95) {
+            print_leave();
+            return;
+        }
+        g_last_synth_epoch = t_epoch;
+        g_have_synth_epoch = 1;
     }
-    g_last_synth_epoch = s0->time;
-    g_have_synth_epoch = 1;
 
     mid[0] = 0.5 * (g_arp_ecef[0][0] + g_arp_ecef[1][0]);
     mid[1] = 0.5 * (g_arp_ecef[0][1] + g_arp_ecef[1][1]);
@@ -1387,6 +1899,8 @@ static void try_synth_virtual_obs(void)
 
     /* Reset per-epoch carrier-side QC counters (build_virt_obs_with_eph fills them). */
     g_qc_n_fix = g_qc_n_float = g_qc_n_drop = g_qc_ref_switch = 0;
+    g_qc_n_lowsnr = 0;
+    g_qc_n_p_only_A = g_qc_n_p_only_B = 0;
 
     /* Prefer ephemeris-aware path (clean clock removal + true geometry). */
     if (g_nav_inited && g_nav_n_total() >= 4) {
@@ -1410,8 +1924,11 @@ static void try_synth_virtual_obs(void)
         return;
     }
 
+    {
+    gtime_t t_epoch = (s0->n > 0) ? s0->time : s1->time;
+
     memset(g_enc_rtcm.cp, 0, sizeof(g_enc_rtcm.cp));
-    g_enc_rtcm.time = s0->time;
+    g_enc_rtcm.time = t_epoch;
     g_enc_rtcm.staid = OUT_VIRT_STAID;
     g_enc_rtcm.seqno = (g_enc_rtcm.seqno + 1) & 7;
     g_enc_rtcm.sta.pos[0] = mid[0];
@@ -1427,7 +1944,7 @@ static void try_synth_virtual_obs(void)
         send_station = 1;
     }
     else {
-        double dt = timediff(s0->time, g_last_station_tx_epoch);
+        double dt = timediff(t_epoch, g_last_station_tx_epoch);
         if (dt >= VIRT_STATION_INTERVAL - 0.5 || dt < -0.5)
             send_station = 1;
     }
@@ -1438,8 +1955,9 @@ static void try_synth_virtual_obs(void)
             tx_agg_len += g_enc_rtcm.nbyte;
         }
         tx_send_buf(g_enc_rtcm.buff, g_enc_rtcm.nbyte);
-        g_last_station_tx_epoch = s0->time;
+        g_last_station_tx_epoch = t_epoch;
         g_have_station_tx_epoch = 1;
+    }
     }
 
     for (k = 0; k < msm_count; k++) {
@@ -1473,13 +1991,20 @@ static void try_synth_virtual_obs(void)
     }
 
     if (used_eph) {
-        printf("VRS [eph] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
-               "Δclk=%+.3fm | rms((εA-εB)/2)=%.3fm | L: fix=%d float=%d drop=%d "
-               "refSwap=%d | obs=%d sta=%d err=%d\n",
-               (unsigned)RTCM_OUT_PORT, tx_agg_len, nv,
+        const char *mode_tag =
+            (g_vrs_mode == VRS_MODE_DUAL)   ? "DUAL"   :
+            (g_vrs_mode == VRS_MODE_A_ONLY) ? "A-only" :
+            (g_vrs_mode == VRS_MODE_B_ONLY) ? "B-only" : "NONE";
+        printf("VRS [eph %s] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) "
+               "clk_B=%+.3fm(%dsv) dclk=%+.3fm | rms((epsA-epsB)/2)=%.3fm | "
+               "L: fix=%d float=%d drop=%d refSwap=%d lowSNR=%d | "
+               "Aonly=%d Bonly=%d | obs=%d sta=%d err=%d\n",
+               mode_tag, (unsigned)RTCM_OUT_PORT, tx_agg_len, nv,
                clk_A, nclk_A, clk_B, nclk_B, clk_A - clk_B,
                rms_eps,
                g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch,
+               g_qc_n_lowsnr,
+               g_qc_n_p_only_A, g_qc_n_p_only_B,
                dec_obs, dec_sta, dec_err);
     }
     else {
@@ -1628,9 +2153,16 @@ static void stream_connect_forever(stream_worker_t *w)
         run_client(s, &w->rtcm, lab, w);
         print_enter();
         if (g_base_n > 0 && w->base_index >= 0 && w->base_index < g_base_n) {
-            g_arp_valid[w->base_index] = 0;
+            /* DO NOT clear g_arp_valid[] on disconnect: the antenna doesn't
+             * physically move when the network blip ends, and we need both
+             * ARPs (even from a dead stream) to keep computing the midpoint
+             * V in SINGLE_X mode. A new 1005 from a reconnected stream will
+             * overwrite the cached value anyway. */
             g_have_mid_print = 0;
             g_have_station_tx_epoch = 0;
+            /* Wipe the snapshot so the next VRS attempt sees s_X.n = 0 and
+             * the mode state machine can switch to SINGLE_other after the
+             * MODE_FAIL_TO_SINGLE hysteresis window. */
             g_epoch_snap[w->base_index].n = 0;
         }
         printf("[%s] disconnected from %s:%u, reconnecting...\n",
