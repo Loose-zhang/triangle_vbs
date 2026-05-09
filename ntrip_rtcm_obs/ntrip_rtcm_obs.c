@@ -20,7 +20,7 @@
  *   RTCM staid is only 12 bits — collisions are normal. Use separate -c streams,
  *   different [label], and/or 1005/1006 ECEF to tell stations apart.
  *
- * Two streams (-c x2), aligned epochs (|Δt|≤0.5 s), no ephemeris / no sat position:
+ * Two streams (-c x2), aligned epochs (|dt|<=0.5 s), no ephemeris / no sat position:
  *   Apollonius (triangle median length) with baseline b = ||ARP2-ARP1|| from 1005/1006:
  *     P_mid = sqrt( max(0, (P_1^2+P_2^2)/2 - b^2/4) )
  *   where P_1,P_2 are the two stations' pseudoranges (slant-range proxies;
@@ -1474,7 +1474,7 @@ static void try_synth_virtual_obs(void)
 
     if (used_eph) {
         printf("VRS [eph] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
-               "Δclk=%+.3fm | rms((εA-εB)/2)=%.3fm | L: fix=%d float=%d drop=%d "
+               "d_clk=%+.3fm | rms((eps_A-eps_B)/2)=%.3fm | L: fix=%d float=%d drop=%d "
                "refSwap=%d | obs=%d sta=%d err=%d\n",
                (unsigned)RTCM_OUT_PORT, tx_agg_len, nv,
                clk_A, nclk_A, clk_B, nclk_B, clk_A - clk_B,

@@ -43,7 +43,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifdef _WIN32
-#include <Windows.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #include <sys/time.h>

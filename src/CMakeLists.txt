@@ -81,9 +81,10 @@ if(UNIX)
     # Linux 或其他 POSIX 系统使用 pthread
     target_link_libraries(B2bLib PUBLIC pthread)
 elseif(WIN32)
-    # Windows 下 MinGW 使用 -mthreads；同时定义 WIN32 以使用 RTKLIB 的临界区实现
     target_compile_definitions(B2bLib PUBLIC WIN32)
-    target_compile_options(B2bLib PUBLIC -mthreads)
+    if(MINGW)
+        target_compile_options(B2bLib PUBLIC -mthreads)
+    endif()
     target_link_libraries(B2bLib PUBLIC ws2_32 winmm)
     message(STATUS "MinGW library path: ${CMAKE_C_IMPLICIT_LINK_DIRECTORIES}")
 endif()
