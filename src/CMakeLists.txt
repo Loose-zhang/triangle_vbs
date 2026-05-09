@@ -71,6 +71,10 @@ set(B2bLIB_SOURCES
 # 生成一个静态库供子项目使用
 add_library(B2bLib STATIC ${B2bLIB_SOURCES})
 
+if(APPLE)
+    target_compile_definitions(B2bLib PUBLIC _DARWIN_C_SOURCE)
+endif()
+
 # 数学库：Unix 需要 libm；MSVC 无独立 libm
 if(UNIX)
     target_link_libraries(B2bLib PUBLIC m)

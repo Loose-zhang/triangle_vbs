@@ -4108,7 +4108,7 @@ static double interpvar0(int sat, double ang, const double *var)
 	return var[i]*(1.0-a+i)+var[i+1]*(a-i);
 }
 /* interpolate antenna phase center variation --------------------------------*/
-static double interpvar1(double azim, double zeni, pcv_t *pcv, int f)
+static double interpvar1(double azim, double zeni, const pcv_t *pcv, int f)
 {
 	double p,q,pcvr=0.0;
 	int izeni,iazim;
@@ -4146,7 +4146,7 @@ static double interpvar1(double azim, double zeni, pcv_t *pcv, int f)
 * return : none
 * notes  : current version does not support azimuth dependent terms
 *-----------------------------------------------------------------------------*/
-extern void antmodel(int sat, pcv_t *pcv, const double *del, const double *azel,
+extern void antmodel(int sat, const pcv_t *pcv, const double *del, const double *azel,
                      int opt, double *dant)
 {
 	double e[3],off[3],cosel=cos(azel[1]);
@@ -4441,4 +4441,3 @@ extern void trim(char *str) {
 extern void settspan(gtime_t ts, gtime_t te) {}
 extern void settime(gtime_t time) {}
 //#endif
-

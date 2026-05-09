@@ -575,31 +575,54 @@ static uint8_t msm_remap_obs_code(int sys, uint8_t code)
     return code;
 }
 
+static int msm_remap_preserves_phase(int sys, uint8_t from, uint8_t to, int fcn)
+{
+    double f_from, f_to;
+
+    if (from == to) return 1;
+
+    /* RTKLIB has historical BDS B1I codes as 1I/1Q; RTCM MSM uses 2I/2Q.
+     * Treat these as label-only remaps even though code2freq() maps 1*
+     * through the modern B1C branch. */
+    if (sys == SYS_CMP) {
+        if (from == CODE_L1I && to == CODE_L2I) return 1;
+        if (from == CODE_L1Q && to == CODE_L2Q) return 1;
+    }
+
+    f_from = code2freq(sys, from, fcn);
+    f_to   = code2freq(sys, to,   fcn);
+
+    return f_from > 0.0 && f_to > 0.0 && fabs(f_from - f_to) < 1.0;
+}
+
 static void remap_obs_codes_for_msm7(obsd_t *data, int n)
 {
     int i, j, prn, sys;
     uint8_t c;
-    double fq;
 
     for (i = 0; i < n; i++) {
         sys = satsys(data[i].sat, &prn);
         for (j = 0; j < NFREQ + NEXOBS; j++) {
+            uint8_t code_was;
             double L_was;
 
             if (data[i].code[j] == CODE_NONE) continue;
             if (data[i].P[j] == 0.0 && data[i].L[j] == 0.0) continue;
+            code_was = data[i].code[j];
             L_was = data[i].L[j];
-            c = msm_remap_obs_code(sys, data[i].code[j]);
+            c = msm_remap_obs_code(sys, code_was);
             if (c == CODE_NONE || !obs_code_in_msm_table(sys, c)) {
                 data[i].code[j] = CODE_NONE;
                 data[i].P[j] = data[i].L[j] = 0.0;
                 continue;
             }
-            if (c != data[i].code[j]) {
+            if (c != code_was) {
                 data[i].code[j] = c;
-                fq = code2freq(sys, c, data[i].freq);
-                if (fq > 0.0 && data[i].P[j] != 0.0 && L_was != 0.0)
-                    data[i].L[j] = data[i].P[j] / (CLIGHT / fq);
+                if (L_was != 0.0 &&
+                    !msm_remap_preserves_phase(sys, code_was, c, data[i].freq)) {
+                    data[i].L[j] = 0.0;
+                    data[i].LLI[j] = 0;
+                }
             }
         }
     }

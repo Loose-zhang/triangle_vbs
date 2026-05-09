@@ -2051,7 +2051,7 @@ EXPORT int seliflc(int optnf, int sys);
 EXPORT int  readpcv(const char *file, pcvs_t *pcvs);
 EXPORT pcv_t *searchpcv(int sat, const char *type, gtime_t time,
                         const pcvs_t *pcvs);
-extern void antmodel(int sat, pcv_t *pcv, const double *del, const double *azel,
+extern void antmodel(int sat, const pcv_t *pcv, const double *del, const double *azel,
 					 int opt, double *dant);
 extern void antmodel_s(int sat, const pcv_t *pcv, double nadir, double *dant);
 
