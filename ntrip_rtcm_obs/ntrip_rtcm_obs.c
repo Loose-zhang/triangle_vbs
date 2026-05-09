@@ -80,12 +80,14 @@ typedef struct {
     const char *host;
     unsigned short port;
     const char *label; /* NULL or argv; if NULL, use label_storage */
+    int eph_only;      /* -e <host> <port> [label]: feed broadcast eph only */
 } cli_stream_t;
 
 typedef struct {
     cli_stream_t s;
     char label_storage[64];
-    int stream_index; /* 0..n-1 in multi-client mode; for ARP midpoint */
+    int stream_index; /* 0..n-1 worker order (any role) */
+    int base_index;   /* 0..g_base_n-1 for base streams; -1 for eph-only */
     rtcm_t rtcm;
 } stream_worker_t;
 
@@ -94,13 +96,22 @@ PPPGlobal_t PPP_Glo;
 
 static rtklib_lock_t g_print_lock;
 
-/* Multi-stream: latest ARP from RTCM 1005/1006 per stream; midpoint when all valid */
-static int g_multi_n;
+/* Multi-stream: latest ARP from RTCM 1005/1006 per BASE stream; midpoint when all valid.
+ * Indexed by base_index, NOT stream_index. Eph-only streams skip these arrays. */
+static int g_multi_n;       /* total streams (base + eph) */
+static int g_base_n;        /* count of base streams (-c) only */
 static double g_arp_ecef[MAX_CLIENT_STREAMS][3];
 static int g_arp_valid[MAX_CLIENT_STREAMS];
 static char g_stream_tag[MAX_CLIENT_STREAMS][64];
 static double g_last_mid_ecef[3];
 static int g_have_mid_print;
+
+/* Global broadcast ephemeris pool, shared by all worker threads.
+ * Updated whenever any stream (base or eph-only) returns ret==2 from input_rtcm3().
+ * Read by synth_virt_obs_with_eph(). Protected by g_nav_lock. */
+static nav_t g_nav;
+static int g_nav_inited;
+static rtklib_lock_t g_nav_lock;
 
 /* Latest epoch snapshot per stream (for dual-base virtual midpoint obs) */
 typedef struct {
@@ -259,20 +270,109 @@ static double norm3diff(const double a[3], const double b[3])
     return sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-/* After each 1005/1006: store ARP; when every stream has ARP, print ECEF midpoint (mean). */
+/* ---- Global broadcast ephemeris pool -----------------------------------*/
+
+static int init_global_nav(void)
+{
+    static const eph_t  eph0  = {0};
+    static const geph_t geph0 = {0};
+    int i;
+
+    if (g_nav_inited) return 1;
+    memset(&g_nav, 0, sizeof(g_nav));
+    g_nav.eph  = (eph_t  *)malloc(sizeof(eph_t)  * MAXSAT * 2);
+    g_nav.geph = (geph_t *)malloc(sizeof(geph_t) * MAXPRNGLO);
+    if (!g_nav.eph || !g_nav.geph) {
+        free(g_nav.eph);  g_nav.eph  = NULL;
+        free(g_nav.geph); g_nav.geph = NULL;
+        return 0;
+    }
+    g_nav.n  = g_nav.nmax  = MAXSAT * 2;
+    g_nav.ng = g_nav.ngmax = MAXPRNGLO;
+    for (i = 0; i < MAXSAT * 2; i++)  g_nav.eph[i]  = eph0;
+    for (i = 0; i < MAXPRNGLO; i++)   g_nav.geph[i] = geph0;
+    rtklib_initlock(&g_nav_lock);
+    g_nav_inited = 1;
+    return 1;
+}
+
+/* Copy the most-recently-decoded ephemeris from a worker's rtcm_t into g_nav.
+ * Called whenever input_rtcm3() returns 2 (eph updated) or 9 (special msgs that
+ * may carry GLONASS FCN tables). */
+static void merge_eph_from_rtcm(const rtcm_t *src)
+{
+    int sat, set, prn, sys, slot;
+
+    if (!g_nav_inited || !src) return;
+    sat = src->ephsat;
+    set = src->ephset;
+    if (sat <= 0 || sat > MAXSAT) return;
+
+    sys = satsys(sat, &prn);
+    rtklib_lock(&g_nav_lock);
+    if (sys == SYS_GLO) {
+        if (prn >= 1 && prn <= MAXPRNGLO)
+            g_nav.geph[prn - 1] = src->nav.geph[prn - 1];
+    }
+    else {
+        slot = (set == 1) ? sat - 1 + MAXSAT : sat - 1;
+        if (slot >= 0 && slot < MAXSAT * 2)
+            g_nav.eph[slot] = src->nav.eph[slot];
+    }
+    /* Iono parameters may arrive in 1019/1042/1044/1045/1046; copy lazily. */
+    memcpy(g_nav.ion_gps, src->nav.ion_gps, sizeof(g_nav.ion_gps));
+    memcpy(g_nav.ion_gal, src->nav.ion_gal, sizeof(g_nav.ion_gal));
+    memcpy(g_nav.ion_qzs, src->nav.ion_qzs, sizeof(g_nav.ion_qzs));
+    memcpy(g_nav.ion_cmp, src->nav.ion_cmp, sizeof(g_nav.ion_cmp));
+    memcpy(g_nav.glo_fcn, src->nav.glo_fcn, sizeof(g_nav.glo_fcn));
+    rtklib_unlock(&g_nav_lock);
+}
+
+/* True when at least one ephemeris of `sat` is in the pool. Cheap, no lock. */
+static int g_nav_has_sat(int sat)
+{
+    int slot;
+    int sys, prn;
+
+    if (!g_nav_inited || sat <= 0 || sat > MAXSAT) return 0;
+    sys = satsys(sat, &prn);
+    if (sys == SYS_GLO)
+        return (prn >= 1 && prn <= MAXPRNGLO) ? (g_nav.geph[prn - 1].sat != 0) : 0;
+    slot = sat - 1;
+    if (g_nav.eph[slot].sat) return 1;
+    if (slot + MAXSAT < MAXSAT * 2 && g_nav.eph[slot + MAXSAT].sat) return 1;
+    return 0;
+}
+
+/* Total ephemeris count for go/no-go on the new VRS path. */
+static int g_nav_n_total(void)
+{
+    int i, c = 0;
+    if (!g_nav_inited) return 0;
+    for (i = 0; i < MAXSAT * 2; i++)
+        if (g_nav.eph[i].sat) c++;
+    for (i = 0; i < MAXPRNGLO; i++)
+        if (g_nav.geph[i].sat) c++;
+    return c;
+}
+
+/* After each 1005/1006: store ARP; when every BASE stream has ARP, print ECEF midpoint (mean).
+ * Eph-only streams (base_index < 0) never feed the midpoint even if they carry 1005/1006. */
 static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worker_t *w)
 {
     int t = last_rtcm3_type(rtcm);
     int i, k, all;
     double mid[3], llh[3];
 
-    if (g_multi_n < 2)
+    if (g_base_n < 2)
         return;
     if (t != 1005 && t != 1006)
         return;
+    if (w->base_index < 0)
+        return;
 
-    k = w->stream_index;
-    if (k < 0 || k >= g_multi_n)
+    k = w->base_index;
+    if (k >= g_base_n)
         return;
 
     print_enter();
@@ -282,7 +382,7 @@ static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worke
     g_arp_valid[k] = 1;
 
     all = 1;
-    for (i = 0; i < g_multi_n; i++) {
+    for (i = 0; i < g_base_n; i++) {
         if (!g_arp_valid[i]) {
             all = 0;
             break;
@@ -294,14 +394,14 @@ static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worke
     }
 
     mid[0] = mid[1] = mid[2] = 0.0;
-    for (i = 0; i < g_multi_n; i++) {
+    for (i = 0; i < g_base_n; i++) {
         mid[0] += g_arp_ecef[i][0];
         mid[1] += g_arp_ecef[i][1];
         mid[2] += g_arp_ecef[i][2];
     }
-    mid[0] /= (double)g_multi_n;
-    mid[1] /= (double)g_multi_n;
-    mid[2] /= (double)g_multi_n;
+    mid[0] /= (double)g_base_n;
+    mid[1] /= (double)g_base_n;
+    mid[2] /= (double)g_base_n;
 
     if (g_have_mid_print && norm3diff(mid, g_last_mid_ecef) < 0.02) {
         print_leave();
@@ -312,7 +412,7 @@ static void update_arp_midpoint_from_1005(const rtcm_t *rtcm, const stream_worke
     g_have_station_tx_epoch = 0;
 
     ecef2pos(mid, llh);
-    printf("\n=== Midpoint (mean ECEF of %d RTCM 1005 ARPs) ===\n", g_multi_n);
+    printf("\n=== Midpoint (mean ECEF of %d base RTCM 1005 ARPs) ===\n", g_base_n);
     printf("  ECEF X=%.4f  Y=%.4f  Z=%.4f (m)\n", mid[0], mid[1], mid[2]);
     printf("  LLH  lat=%.8f deg  lon=%.8f deg  h_ellip=%.4f (m)\n",
            llh[0] * R2D, llh[1] * R2D, llh[2]);
@@ -646,22 +746,624 @@ static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunk
     return nchunk;
 }
 
-/* Two bases: Apollonius on P and on carrier cycles; same b. Encode 1005+MSM7 TCP :52000. */
+/* ------------------------------------------------------------------------- */
+/* Builder A: legacy Apollonius median formula on P and L (cycles).           */
+/* Used as fallback when broadcast ephemeris is not yet available.            */
+/* ------------------------------------------------------------------------- */
+static int build_virt_obs_apollonius(
+    const epoch_snap_t *s0, const epoch_snap_t *s1,
+    double b, obsd_t *virt, int *pnv)
+{
+    int i0, i1, j, j1, sat, prn, sys, nv = 0;
+    double P0, P1, Pm_sq, Pm, freq, lam, bcyc, L0, L1, Lm_sq;
+    const obsd_t *d0, *d1;
+
+    for (i0 = 0; i0 < s0->n && nv < MAXOBS; i0++) {
+        obsd_t vd;
+        int any = 0;
+        d0 = &s0->data[i0];
+        sat = d0->sat;
+        i1 = find_sat_in_snap(s1, sat);
+        if (i1 < 0) continue;
+        d1 = &s1->data[i1];
+
+        memset(&vd, 0, sizeof(vd));
+        vd.time = d0->time;
+        vd.sat = sat;
+        vd.freq = d0->freq;
+        sys = satsys(sat, &prn); (void)prn;
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            if (d0->code[j] == CODE_NONE) continue;
+            if (d0->P[j] == 0.0 && d0->L[j] == 0.0) continue;
+            j1 = find_same_code_idx(d1, d0->code[j]);
+            if (j1 < 0) continue;
+
+            P0 = d0->P[j]; P1 = d1->P[j1];
+            if (P0 <= 0.0 || P1 <= 0.0) continue;
+
+            Pm_sq = 0.5 * (P0 * P0 + P1 * P1) - 0.25 * b * b;
+            if (Pm_sq < 0.0) continue;
+            Pm = sqrt(Pm_sq);
+
+            vd.code[j] = d0->code[j];
+            vd.P[j] = Pm;
+            vd.L[j] = 0.0;
+            freq = code2freq(sys, d0->code[j], d0->freq);
+            lam = (freq > 0.0) ? CLIGHT / freq : 0.0;
+            if (lam > 0.0 && d0->L[j] != 0.0 && d1->L[j1] != 0.0) {
+                L0 = d0->L[j]; L1 = d1->L[j1];
+                bcyc = b / lam;
+                Lm_sq = 0.5 * (L0 * L0 + L1 * L1) - 0.25 * bcyc * bcyc;
+                if (Lm_sq >= 0.0) vd.L[j] = sqrt(Lm_sq);
+            }
+            vd.SNR[j] = (d0->SNR[j] && d1->SNR[j1])
+                            ? (uint16_t)((d0->SNR[j] + d1->SNR[j1]) / 2)
+                            : (d0->SNR[j] ? d0->SNR[j] : d1->SNR[j1]);
+            any = 1;
+        }
+        if (any) virt[nv++] = vd;
+    }
+    *pnv = nv;
+    return nv > 0 ? 1 : 0;
+}
+
+/* Per-satellite cached geometry for the ephemeris-aware builder.
+ * Static under print_lock (try_synth_virtual_obs holds print_lock entire run). */
+typedef struct {
+    int sat;
+    int valid;
+    double dts0;                /* satellite clock bias (s) at signal transmit time */
+    double rho_A, rho_B, rho_V; /* Sagnac-aware geometric ranges */
+    double ion_A, ion_B, ion_V; /* Klobuchar L1 vertical-mapped iono delay (m) */
+    double trp_A, trp_B, trp_V; /* Saastamoinen tropo delay (m) */
+    double elev_A;              /* base-A elevation (rad), used for reference-sat picking */
+} sat_geom_t;
+
+static sat_geom_t g_geom_cache[MAXOBS];
+
+/* ------------------------------------------------------------------------- */
+/* Phase-side: A-B double-difference integer-ambiguity cache.                 */
+/*                                                                            */
+/* For each (system, code) we maintain a single reference satellite j*; for   */
+/* every (sat k, code) with valid L on both bases we cache the fixed integer  */
+/*   DD_n^k = (N_A^k - N_B^k) - (N_A^j* - N_B^j*)                             */
+/* in cycles. The clock-difference term cancels in DD, so DD_n is recoverable */
+/* by simple round-to-nearest with mm-level noise on short baselines.         */
+/*                                                                            */
+/* On reference-sat switch j_old -> j_new we transform every cached entry     */
+/*   DD_n_new^k = DD_n_old^k - DD_n_old^{j_new}                               */
+/* so previously-fixed sats keep their fix without re-search.                 */
+/* ------------------------------------------------------------------------- */
+
+#define VRS_AMB_FIX_THRES 0.20  /* cycle: round-to-int residual must be below this */
+#define VRS_AMB_KEEP_THRES 0.40 /* cycle: cached fix re-validates if within this */
+
+typedef struct {
+    int    valid;       /* 1 = dd_n is current, 0 = unfixed/invalidated */
+    double dd_n;        /* fixed DD integer (cycles), see formula above */
+    int    ref_sat;     /* the reference sat this dd_n is wrt (must match g_ref_sat) */
+    gtime_t t_last;     /* last epoch this entry was confirmed */
+} amb_cache_t;
+
+/* Reference sat per (sys_bit_index, code-1).  0 = none. */
+static int          g_ref_sat[7][MAXCODE];
+static amb_cache_t  g_amb[MAXSAT][MAXCODE];
+
+/* Per-epoch QC counters (set by build_virt_obs_with_eph). */
+static int g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch;
+
+static void init_amb_cache(void)
+{
+    memset(g_ref_sat, 0, sizeof(g_ref_sat));
+    memset(g_amb,     0, sizeof(g_amb));
+}
+
+static double median_of(double *a, int n)
+{
+    int i, j;
+    double t;
+    /* insertion sort (n is small, typically <= 40) */
+    for (j = 1; j < n; j++) {
+        t = a[j]; i = j - 1;
+        while (i >= 0 && a[i] > t) { a[i + 1] = a[i]; i--; }
+        a[i + 1] = t;
+    }
+    return (n & 1) ? a[n / 2] : 0.5 * (a[n / 2 - 1] + a[n / 2]);
+}
+
+/* Locate row index in a snapshot for the (sat, code) pair, with valid L on both
+ * (P doesn't matter). Returns slot j on s0 and *j1 on s1, or -1 on either if not
+ * found. We require *both* L != 0 because the DD step needs both phases. */
+static int find_obs_idx_with_L(const epoch_snap_t *s0, int i0,
+                               const epoch_snap_t *s1, int *out_i1, int *out_j1,
+                               uint8_t code)
+{
+    int j, j1, i1;
+    if (s0->data[i0].sat == 0) return -1;
+    for (j = 0; j < NFREQ + NEXOBS; j++) {
+        if (s0->data[i0].code[j] == code &&
+            s0->data[i0].L[j] != 0.0) break;
+    }
+    if (j >= NFREQ + NEXOBS) return -1;
+    i1 = find_sat_in_snap(s1, s0->data[i0].sat);
+    if (i1 < 0) return -1;
+    j1 = find_same_code_idx(&s1->data[i1], code);
+    if (j1 < 0 || s1->data[i1].L[j1] == 0.0) return -1;
+    *out_i1 = i1;
+    *out_j1 = j1;
+    return j;
+}
+
+/* Pick the highest-elevation satellite tracked on both bases with a valid L
+ * for the given (sys, code). Returns sat number or 0 if none qualifies. */
+static int pick_ref_sat(int sys, uint8_t code,
+                        const epoch_snap_t *s0, const epoch_snap_t *s1)
+{
+    int best_sat = 0;
+    double best_elev = 0.0;
+    int i, prn, dummy_i1, dummy_j1, j;
+
+    for (i = 0; i < s0->n; i++) {
+        const sat_geom_t *g = &g_geom_cache[i];
+        if (!g->valid) continue;
+        if (satsys(g->sat, &prn) != sys) continue;
+        j = find_obs_idx_with_L(s0, i, s1, &dummy_i1, &dummy_j1, code);
+        if (j < 0) continue;
+        if (g->elev_A > best_elev) {
+            best_elev = g->elev_A;
+            best_sat = g->sat;
+        }
+    }
+    return best_sat;
+}
+
+/* On reference-sat switch j_old -> j_new for (sys, code):
+ *   DD_n_new^k = DD_n_old^k - DD_n_old^{j_new}
+ * (Old j_new entry has valid DD_n_old^{j_new} cached vs j_old; after swap we
+ *  set j_new's slot to dd_n=0, and j_old's slot to -DD_n_old^{j_new}.)
+ * Sats that were not fixed under the old ref stay invalid. */
+static void transform_amb_on_ref_change(int sys, uint8_t code,
+                                        int j_old, int j_new)
+{
+    double dd_jnew = 0.0;
+    int i, prn, sat;
+    int code_idx = (int)code - 1;
+
+    if (code_idx < 0 || code_idx >= MAXCODE) return;
+    if (j_new <= 0 || j_new > MAXSAT) return;
+
+    if (j_old > 0 && j_old <= MAXSAT &&
+        g_amb[j_new - 1][code_idx].valid &&
+        g_amb[j_new - 1][code_idx].ref_sat == j_old) {
+        dd_jnew = g_amb[j_new - 1][code_idx].dd_n;
+    }
+    else {
+        /* No bridge — invalidate everything for this (sys, code) and re-fix
+         * from scratch on the next iteration. */
+        for (i = 0; i < MAXSAT; i++) {
+            sat = i + 1;
+            if (satsys(sat, &prn) != sys) continue;
+            g_amb[i][code_idx].valid = 0;
+        }
+        if (j_new > 0)
+            g_amb[j_new - 1][code_idx].dd_n = 0.0;
+        return;
+    }
+
+    for (i = 0; i < MAXSAT; i++) {
+        amb_cache_t *a = &g_amb[i][code_idx];
+        sat = i + 1;
+        if (satsys(sat, &prn) != sys) continue;
+        if (!a->valid || a->ref_sat != j_old) {
+            a->valid = 0;
+            continue;
+        }
+        a->dd_n   -= dd_jnew;
+        a->ref_sat = j_new;
+    }
+    /* j_new becomes the new origin: dd_n=0 by definition. */
+    g_amb[j_new - 1][code_idx].valid   = 1;
+    g_amb[j_new - 1][code_idx].dd_n    = 0.0;
+    g_amb[j_new - 1][code_idx].ref_sat = j_new;
+    /* j_old is now a regular satellite at -dd_jnew. */
+    if (j_old > 0 && j_old <= MAXSAT) {
+        g_amb[j_old - 1][code_idx].valid   = 1;
+        g_amb[j_old - 1][code_idx].dd_n    = -dd_jnew;
+        g_amb[j_old - 1][code_idx].ref_sat = j_new;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Builder B: broadcast-ephemeris-aware VRS pseudorange.                      */
+/*                                                                            */
+/* For each satellite k present in BOTH base snapshots:                       */
+/*   1) sat pos r_s and clock dt_s via satposs() with broadcast eph           */
+/*   2) sagnac-aware geometric ranges rho_A, rho_B, rho_V via geodist()       */
+/*   3) Klobuchar L1 iono and Saastamoinen tropo at A, B, V                   */
+/*                                                                            */
+/* Per-base receiver clock (m) is estimated as:                               */
+/*   c*dt_rcv_i = median over sats of (P_i - rho_i + c*dt_s - I_i - T_i)      */
+/* using the first valid pseudorange of each satellite (single-frequency for  */
+/* clock, robust enough for code-level VRS).                                  */
+/*                                                                            */
+/* For each (sat, signal):                                                    */
+/*   eps_A = P_A - rho_A + c*dt_s - I_A - T_A - c*dt_rcv_A   [code residual]  */
+/*   eps_B = P_B - rho_B + c*dt_s - I_B - T_B - c*dt_rcv_B                    */
+/*   c*dt_rcv_V = (c*dt_rcv_A + c*dt_rcv_B) / 2                               */
+/*   P_V = rho_V - c*dt_s + I_V + T_V + c*dt_rcv_V + 0.5*(eps_A + eps_B)      */
+/*                                                                            */
+/* Carrier still uses Apollonius (placeholder until phase upgrade).           */
+/* Returns 1 on success (nv populated), 0 if not enough data/ephemeris.       */
+/* ------------------------------------------------------------------------- */
+static int build_virt_obs_with_eph(
+    const epoch_snap_t *s0, const epoch_snap_t *s1,
+    const double rA[3], const double rB[3], const double rV[3],
+    obsd_t *virt, int *pnv,
+    double *clk_A_out, double *clk_B_out,
+    int *nclk_A_out, int *nclk_B_out,
+    double *rms_eps_out)
+{
+    static double rs[6 * MAXOBS];
+    static double dts[2 * MAXOBS];
+    static double var[MAXOBS];
+    static int    svh[MAXOBS];
+    static double res_A[MAXOBS], res_B[MAXOBS];
+    static double tmp[MAXOBS];
+
+    double posA[3], posB[3], posV[3];
+    double e[3];
+    double clk_A = 0.0, clk_B = 0.0, clk_V;
+    double sum_dd2 = 0.0;
+    int n_dd = 0;
+    int n_res_A = 0, n_res_B = 0;
+    int i0, i1, j, j1, sat, sys, prn, nv = 0;
+    double b = norm3diff(rA, rB);
+    double azel[2];
+
+    if (!g_nav_inited) return 0;
+    if (s0->n <= 0 || s1->n <= 0) return 0;
+    if (s0->n > MAXOBS) return 0;
+
+    ecef2pos(rA, posA);
+    ecef2pos(rB, posB);
+    ecef2pos(rV, posV);
+
+    /* satposs handles transit-time iteration; needs P[0] or first valid P. */
+    rtklib_lock(&g_nav_lock);
+    satposs(s0->time, s0->data, s0->n, &g_nav, EPHOPT_BRDC, rs, dts, var, svh);
+
+    for (i0 = 0; i0 < s0->n; i0++) {
+        const double *r_s = rs + 6 * i0;
+        const double *ion_p;
+        sat_geom_t *g = &g_geom_cache[i0];
+        g->valid = 0;
+        g->sat = s0->data[i0].sat;
+        if (svh[i0]) continue;
+        if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
+
+        g->rho_A = geodist(r_s, rA, e); satazel(posA, e, azel);
+        if (g->rho_A <= 0.0 || azel[1] < 5.0 * D2R) continue;
+        g->elev_A = azel[1];
+        g->ion_A = ionmodel(s0->time, g_nav.ion_gps, posA, azel);
+        g->trp_A = tropmodel(s0->time, posA, azel, 0.7);
+        if (satsys(g->sat, NULL) == SYS_CMP)
+            g->ion_A = ionmodel(s0->time, g_nav.ion_cmp, posA, azel);
+
+        g->rho_B = geodist(r_s, rB, e); satazel(posB, e, azel);
+        if (g->rho_B <= 0.0 || azel[1] < 5.0 * D2R) continue;
+        ion_p = (satsys(g->sat, NULL) == SYS_CMP) ? g_nav.ion_cmp : g_nav.ion_gps;
+        g->ion_B = ionmodel(s0->time, ion_p, posB, azel);
+        g->trp_B = tropmodel(s0->time, posB, azel, 0.7);
+
+        g->rho_V = geodist(r_s, rV, e); satazel(posV, e, azel);
+        if (g->rho_V <= 0.0) continue;
+        g->ion_V = ionmodel(s0->time, ion_p, posV, azel);
+        g->trp_V = tropmodel(s0->time, posV, azel, 0.7);
+
+        g->dts0 = dts[2 * i0];
+        g->valid = 1;
+    }
+    rtklib_unlock(&g_nav_lock);
+
+    /* Pass 1: per-sat clock residuals using each base's first valid P. */
+    for (i0 = 0; i0 < s0->n; i0++) {
+        const obsd_t *d0 = &s0->data[i0];
+        const obsd_t *d1;
+        const sat_geom_t *g = &g_geom_cache[i0];
+        double P0 = 0.0, P1 = 0.0;
+
+        if (!g->valid) continue;
+        i1 = find_sat_in_snap(s1, d0->sat);
+        if (i1 < 0) continue;
+        d1 = &s1->data[i1];
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            if (P0 == 0.0 && d0->P[j] > 0.0) P0 = d0->P[j];
+            if (P1 == 0.0 && d1->P[j] > 0.0) P1 = d1->P[j];
+            if (P0 != 0.0 && P1 != 0.0) break;
+        }
+        if (P0 > 0.0)
+            res_A[n_res_A++] = P0 - g->rho_A + CLIGHT * g->dts0 - g->ion_A - g->trp_A;
+        if (P1 > 0.0)
+            res_B[n_res_B++] = P1 - g->rho_B + CLIGHT * g->dts0 - g->ion_B - g->trp_B;
+    }
+    if (n_res_A < 4 || n_res_B < 4) return 0;
+
+    memcpy(tmp, res_A, (size_t)n_res_A * sizeof(double));
+    clk_A = median_of(tmp, n_res_A);
+    memcpy(tmp, res_B, (size_t)n_res_B * sizeof(double));
+    clk_B = median_of(tmp, n_res_B);
+    clk_V = 0.5 * (clk_A + clk_B);
+
+    /* ----- Pass 2a: pre-scan codes seen this epoch and refresh ref sats ---- */
+    {
+        int seen_sys_code[7][MAXCODE];   /* track which (sys, code) appeared */
+        int sysmap[7] = {SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_SBS, SYS_CMP, SYS_IRN};
+        int si, ci;
+        memset(seen_sys_code, 0, sizeof(seen_sys_code));
+        for (i0 = 0; i0 < s0->n; i0++) {
+            const obsd_t *d0 = &s0->data[i0];
+            int sb;
+            if (!g_geom_cache[i0].valid) continue;
+            sb = sys_bit_index(satsys(d0->sat, &prn));
+            if (sb < 0) continue;
+            for (j = 0; j < NFREQ + NEXOBS; j++) {
+                if (d0->code[j] == CODE_NONE) continue;
+                if (d0->L[j] == 0.0) continue;
+                seen_sys_code[sb][d0->code[j] - 1] = 1;
+            }
+        }
+        for (si = 0; si < 7; si++) {
+            for (ci = 0; ci < MAXCODE; ci++) {
+                int old_ref, cand_ref;
+                int old_still_visible;
+                int dummy_i1, dummy_j1;
+                if (!seen_sys_code[si][ci]) continue;
+                old_ref = g_ref_sat[si][ci];
+                old_still_visible = 0;
+                if (old_ref > 0 && old_ref <= MAXSAT) {
+                    /* Find old_ref in s0 and verify both bases see L on this code */
+                    for (i0 = 0; i0 < s0->n; i0++) {
+                        if (s0->data[i0].sat != old_ref) continue;
+                        if (!g_geom_cache[i0].valid) break;
+                        if (find_obs_idx_with_L(s0, i0, s1, &dummy_i1, &dummy_j1,
+                                                (uint8_t)(ci + 1)) >= 0)
+                            old_still_visible = 1;
+                        break;
+                    }
+                }
+                if (old_still_visible) continue;   /* keep current ref */
+
+                cand_ref = pick_ref_sat(sysmap[si], (uint8_t)(ci + 1), s0, s1);
+                if (cand_ref == 0) {
+                    /* No valid sat at all: invalidate this (sys, code) family */
+                    int kk;
+                    for (kk = 0; kk < MAXSAT; kk++) {
+                        if (satsys(kk + 1, &prn) != sysmap[si]) continue;
+                        g_amb[kk][ci].valid = 0;
+                    }
+                    g_ref_sat[si][ci] = 0;
+                    continue;
+                }
+                if (old_ref != cand_ref) {
+                    transform_amb_on_ref_change(sysmap[si], (uint8_t)(ci + 1),
+                                                old_ref, cand_ref);
+                    g_ref_sat[si][ci] = cand_ref;
+                    g_qc_ref_switch++;
+                }
+            }
+        }
+    }
+
+    /* ----- Pass 2b: cache per-(sat,code) ref-sat geometry for DD ----------- */
+    /* For each (sys, code) we need rho_A^ref, rho_B^ref, L_A^ref, L_B^ref.   */
+    /* Fast path: index sat -> i0_in_s0. */
+    {
+        static int sat_to_i0[MAXSAT + 1];
+        memset(sat_to_i0, -1, sizeof(sat_to_i0));
+        for (i0 = 0; i0 < s0->n; i0++)
+            if (s0->data[i0].sat > 0 && s0->data[i0].sat <= MAXSAT)
+                sat_to_i0[s0->data[i0].sat] = i0;
+
+        for (i0 = 0; i0 < s0->n && nv < MAXOBS; i0++) {
+            const obsd_t *d0 = &s0->data[i0];
+            const obsd_t *d1;
+            const sat_geom_t *g = &g_geom_cache[i0];
+            obsd_t vd;
+            int any = 0;
+            int sb;
+            double freq, lam;
+
+            if (!g->valid) continue;
+            i1 = find_sat_in_snap(s1, d0->sat);
+            if (i1 < 0) continue;
+            d1 = &s1->data[i1];
+            sat = d0->sat;
+            sys = satsys(sat, &prn); (void)prn;
+            sb = sys_bit_index(sys);
+            if (sb < 0) continue;
+
+            memset(&vd, 0, sizeof(vd));
+            vd.time = d0->time;
+            vd.sat = sat;
+            vd.freq = d0->freq;
+
+            for (j = 0; j < NFREQ + NEXOBS; j++) {
+                double eps_A, eps_B, Pv;
+                if (d0->code[j] == CODE_NONE) continue;
+                j1 = find_same_code_idx(d1, d0->code[j]);
+                if (j1 < 0) continue;
+
+                /* ----- Pseudorange path (unchanged from previous version) ----- */
+                if (d0->P[j] > 0.0 && d1->P[j1] > 0.0) {
+                    eps_A = d0->P[j]   - g->rho_A + CLIGHT * g->dts0
+                          - g->ion_A - g->trp_A - clk_A;
+                    eps_B = d1->P[j1]  - g->rho_B + CLIGHT * g->dts0
+                          - g->ion_B - g->trp_B - clk_B;
+                    if (fabs(eps_A - eps_B) > 30.0) {
+                        /* multipath/slip on this signal — skip whole signal */
+                        continue;
+                    }
+                    sum_dd2 += (eps_A - eps_B) * (eps_A - eps_B);
+                    n_dd++;
+                    Pv = g->rho_V - CLIGHT * g->dts0 + g->ion_V + g->trp_V + clk_V
+                       + 0.5 * (eps_A + eps_B);
+                    vd.code[j] = d0->code[j];
+                    vd.P[j] = Pv;
+                    vd.SNR[j] = (d0->SNR[j] && d1->SNR[j1])
+                                    ? (uint16_t)((d0->SNR[j] + d1->SNR[j1]) / 2)
+                                    : (d0->SNR[j] ? d0->SNR[j] : d1->SNR[j1]);
+                    any = 1;
+                }
+                else {
+                    /* No P on at least one base: skip both P and L for safety. */
+                    continue;
+                }
+
+                /* ----- Carrier path: DD-fix between A and B, then average ----- */
+                vd.L[j] = 0.0;
+                if (d0->L[j] == 0.0 || d1->L[j1] == 0.0) {
+                    /* Mixed L availability; drop carrier (avoid ambig mixing) */
+                    g_qc_n_drop++;
+                    continue;
+                }
+                freq = code2freq(sys, d0->code[j], d0->freq);
+                lam = (freq > 0.0) ? CLIGHT / freq : 0.0;
+                if (lam <= 0.0) continue;
+
+                {
+                    int ci = (int)d0->code[j] - 1;
+                    int ref_sat = g_ref_sat[sb][ci];
+                    int ref_i0;
+                    int ref_j0_idx, ref_j1_idx;
+                    int ref_i1;
+                    amb_cache_t *a = &g_amb[sat - 1][ci];
+                    int slip = ((d0->LLI[j] | d1->LLI[j1]) & 1);
+
+                    if (ref_sat <= 0) {
+                        /* No ref sat: cannot DD; skip carrier */
+                        g_qc_n_drop++;
+                        continue;
+                    }
+                    ref_i0 = sat_to_i0[ref_sat];
+                    if (ref_i0 < 0 || !g_geom_cache[ref_i0].valid) {
+                        g_qc_n_drop++;
+                        continue;
+                    }
+                    /* Locate ref sat's L on both bases for THIS code */
+                    if (find_obs_idx_with_L(s0, ref_i0, s1, &ref_i1, &ref_j1_idx,
+                                            d0->code[j]) < 0) {
+                        g_qc_n_drop++;
+                        continue;
+                    }
+                    /* Get the L slot index on s0 for ref */
+                    for (ref_j0_idx = 0; ref_j0_idx < NFREQ + NEXOBS; ref_j0_idx++) {
+                        if (s0->data[ref_i0].code[ref_j0_idx] == d0->code[j] &&
+                            s0->data[ref_i0].L[ref_j0_idx] != 0.0) break;
+                    }
+                    if (ref_j0_idx >= NFREQ + NEXOBS) { g_qc_n_drop++; continue; }
+
+                    {
+                        const obsd_t *r0 = &s0->data[ref_i0];
+                        const obsd_t *r1 = &s1->data[ref_i1];
+                        const sat_geom_t *gr = &g_geom_cache[ref_i0];
+                        double dd_geom_cyc, dd_float, dd_n_round, dd_resid;
+                        double L_B_aligned, L_A_at_V, L_B_at_V, L_V_avg;
+                        int slip_ref = ((r0->LLI[ref_j0_idx] | r1->LLI[ref_j1_idx]) & 1);
+
+                        if (sat == ref_sat) {
+                            /* Ref sat itself: dd_n = 0 by definition. */
+                            a->valid   = 1;
+                            a->dd_n    = 0.0;
+                            a->ref_sat = ref_sat;
+                            a->t_last  = d0->time;
+                        }
+                        else {
+                            /* DD float ambiguity (cycles).
+                             * (clk_A - clk_B)/lam cancels exactly across SD-SD. */
+                            dd_geom_cyc = ((g->rho_A  - g->rho_B)
+                                         - (gr->rho_A - gr->rho_B)) / lam;
+                            dd_float = (d0->L[j]  - d1->L[j1]
+                                      - r0->L[ref_j0_idx] + r1->L[ref_j1_idx])
+                                     - dd_geom_cyc;
+
+                            if (slip || slip_ref) a->valid = 0;
+
+                            if (a->valid && a->ref_sat == ref_sat &&
+                                fabs(dd_float - a->dd_n) < VRS_AMB_KEEP_THRES) {
+                                /* Cached fix still consistent — reuse. */
+                                a->t_last = d0->time;
+                            }
+                            else {
+                                dd_n_round = floor(dd_float + 0.5);
+                                dd_resid = dd_float - dd_n_round;
+                                if (fabs(dd_resid) <= VRS_AMB_FIX_THRES) {
+                                    a->valid   = 1;
+                                    a->dd_n    = dd_n_round;
+                                    a->ref_sat = ref_sat;
+                                    a->t_last  = d0->time;
+                                }
+                                else {
+                                    a->valid = 0;
+                                }
+                            }
+                        }
+
+                        if (!a->valid) {
+                            /* Float / unfixable — drop carrier for this (sat, code).
+                             * Keeps ALL output sats on the same averaged-formula
+                             * convention so DD at the rover stays integer. */
+                            g_qc_n_float++;
+                            continue;
+                        }
+
+                        /* Build VRS carrier via clock-cancelling averaging.
+                         * L_B is realigned to base-A's reference frame using DD_n;
+                         * (clk_A - clk_B) does NOT need to be subtracted because
+                         * its noise (~1.5 cyc on B1I) would dominate carrier noise.
+                         * The resulting L_V has effective ambig
+                         *   N_A^k + 0.5 * (N_B^ref - N_A^ref)
+                         * which is the same half-integer offset for ALL sats and
+                         * ALL epochs (until ref switch); so rover DD stays integer. */
+                        L_B_aligned = d1->L[j1] + a->dd_n;
+                        L_A_at_V    = d0->L[j]  + (g->rho_V - g->rho_A) / lam;
+                        L_B_at_V    = L_B_aligned + (g->rho_V - g->rho_B) / lam;
+                        L_V_avg     = 0.5 * (L_A_at_V + L_B_at_V);
+                        vd.L[j] = L_V_avg;
+                        g_qc_n_fix++;
+                    }
+                }
+            }
+            if (any) virt[nv++] = vd;
+        }
+    }
+
+    *pnv = nv;
+    if (clk_A_out)    *clk_A_out    = clk_A;
+    if (clk_B_out)    *clk_B_out    = clk_B;
+    if (nclk_A_out)   *nclk_A_out   = n_res_A;
+    if (nclk_B_out)   *nclk_B_out   = n_res_B;
+    if (rms_eps_out)  *rms_eps_out  = (n_dd > 0) ? sqrt(sum_dd2 / n_dd) * 0.5 : 0.0;
+    return 1;
+}
+
+/* Two bases: ephemeris path (clock-corrected average) preferred, Apollonius fallback. */
 static void try_synth_virtual_obs(void)
 {
     const epoch_snap_t *s0 = &g_epoch_snap[0], *s1 = &g_epoch_snap[1];
-    double P0, P1, Pm_sq, Pm, b, freq, lam, bcyc, L0, L1, Lm_sq, Lm;
-    double mid[3];
-    int i0, i1, j, j1, sat, prn, sys;
-    int nv, k, msm_count, send_station = 0;
+    double b, mid[3];
+    int nv = 0, k, msm_count, send_station = 0;
     msm_chunk_t msm_chunks[MSM_MAX_CHUNKS];
     uint8_t tx_agg[16384];
     int tx_agg_len = 0;
     int dec_obs = 0, dec_sta = 0, dec_err = 0;
     obsd_t virt[MAXOBS];
-    const obsd_t *d0, *d1;
+    int used_eph = 0;
+    double clk_A = 0.0, clk_B = 0.0, rms_eps = 0.0;
+    int nclk_A = 0, nclk_B = 0;
 
-    if (g_multi_n != 2) return;
+    if (g_base_n != 2) return;
     if (!g_enc_inited) return;
     if (s0->n <= 0 || s1->n <= 0) return;
     if (fabs(timediff(s0->time, s1->time)) > 0.5) return;
@@ -683,67 +1385,27 @@ static void try_synth_virtual_obs(void)
     mid[1] = 0.5 * (g_arp_ecef[0][1] + g_arp_ecef[1][1]);
     mid[2] = 0.5 * (g_arp_ecef[0][2] + g_arp_ecef[1][2]);
 
-    nv = 0;
-    for (i0 = 0; i0 < s0->n && nv < MAXOBS; i0++) {
-        obsd_t vd;
-        int any = 0;
+    /* Reset per-epoch carrier-side QC counters (build_virt_obs_with_eph fills them). */
+    g_qc_n_fix = g_qc_n_float = g_qc_n_drop = g_qc_ref_switch = 0;
 
-        d0 = &s0->data[i0];
-        sat = d0->sat;
-        i1 = find_sat_in_snap(s1, sat);
-        if (i1 < 0) continue;
-        d1 = &s1->data[i1];
-
-        memset(&vd, 0, sizeof(vd));
-        vd.time = d0->time;
-        vd.sat = sat;
-        vd.freq = d0->freq;
-
-        sys = satsys(sat, &prn);
-        (void)prn;
-
-        for (j = 0; j < NFREQ + NEXOBS; j++) {
-            if (d0->code[j] == CODE_NONE) continue;
-            if (d0->P[j] == 0.0 && d0->L[j] == 0.0) continue;
-            j1 = find_same_code_idx(d1, d0->code[j]);
-            if (j1 < 0) continue;
-
-            P0 = d0->P[j];
-            P1 = d1->P[j];
-            if (P0 <= 0.0 || P1 <= 0.0) continue;
-
-            Pm_sq = 0.5 * (P0 * P0 + P1 * P1) - 0.25 * b * b;
-            if (Pm_sq < 0.0) continue;
-            Pm = sqrt(Pm_sq);
-
-            vd.code[j] = d0->code[j];
-            vd.P[j] = Pm;
-            vd.L[j] = 0.0;
-            freq = code2freq(sys, d0->code[j], d0->freq);
-            lam = (freq > 0.0) ? CLIGHT / freq : 0.0;
-            if (lam > 0.0 && d0->L[j] != 0.0 && d1->L[j1] != 0.0) {
-                L0 = d0->L[j];
-                L1 = d1->L[j1];
-                bcyc = b / lam;
-                Lm_sq = 0.5 * (L0 * L0 + L1 * L1) - 0.25 * bcyc * bcyc;
-                if (Lm_sq >= 0.0) {
-                    Lm = sqrt(Lm_sq);
-                    vd.L[j] = Lm;
-                }
-            }
-            if (d0->SNR[j] && d1->SNR[j1])
-                vd.SNR[j] = (d0->SNR[j] + d1->SNR[j1]) / 2;
-            else
-                vd.SNR[j] = d0->SNR[j] ? d0->SNR[j] : d1->SNR[j1];
-            any = 1;
+    /* Prefer ephemeris-aware path (clean clock removal + true geometry). */
+    if (g_nav_inited && g_nav_n_total() >= 4) {
+        if (build_virt_obs_with_eph(s0, s1, g_arp_ecef[0], g_arp_ecef[1], mid,
+                                    virt, &nv, &clk_A, &clk_B,
+                                    &nclk_A, &nclk_B, &rms_eps)) {
+            used_eph = 1;
         }
-        if (any)
-            virt[nv++] = vd;
+    }
+    if (!used_eph) {
+        build_virt_obs_apollonius(s0, s1, b, virt, &nv);
     }
 
     prepare_virt_for_msm7(virt, &nv);
 
     if (nv <= 0) {
+        printf("VRS [%s]: no valid sats this epoch (eph_n=%d)\n",
+               used_eph ? "eph" : "apollonius", g_nav_n_total());
+        fflush(stdout);
         print_leave();
         return;
     }
@@ -810,8 +1472,21 @@ static void try_synth_virtual_obs(void)
             dec_sta++;
     }
 
-    printf("Virtual RTCM -> port %u: TX %d B; parse check obs_epoch=%d station=%d err=%d\n",
-           (unsigned)RTCM_OUT_PORT, tx_agg_len, dec_obs, dec_sta, dec_err);
+    if (used_eph) {
+        printf("VRS [eph] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
+               "Δclk=%+.3fm | rms((εA-εB)/2)=%.3fm | L: fix=%d float=%d drop=%d "
+               "refSwap=%d | obs=%d sta=%d err=%d\n",
+               (unsigned)RTCM_OUT_PORT, tx_agg_len, nv,
+               clk_A, nclk_A, clk_B, nclk_B, clk_A - clk_B,
+               rms_eps,
+               g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch,
+               dec_obs, dec_sta, dec_err);
+    }
+    else {
+        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d eph_n=%d | obs=%d sta=%d err=%d\n",
+               (unsigned)RTCM_OUT_PORT, tx_agg_len, nv, g_nav_n_total(),
+               dec_obs, dec_sta, dec_err);
+    }
     fflush(stdout);
     print_leave();
 }
@@ -862,25 +1537,34 @@ static sock_t tcp_connect_host(const char *host, unsigned short port, int *err)
     return s;
 }
 
-/* w_mid non-NULL only in multi-client mode (for 1005/1006 midpoint). */
+/* w_mid non-NULL only in multi-client mode (for 1005/1006 midpoint and eph merge). */
 static int run_client(sock_t cfd, rtcm_t *rtcm, const char *label, stream_worker_t *w_mid)
 {
     uint8_t buf[4096];
     int n, i, ret;
     const char *tag = stream_tag(label);
+    int eph_only = (w_mid != NULL) ? w_mid->s.eph_only : 0;
 
     while ((n = (int)recv(cfd, (char *)buf, (int)sizeof(buf), 0)) > 0) {
         for (i = 0; i < n; i++) {
             ret = input_rtcm3(rtcm, buf[i]);
             if (ret == 1) {
+                /* Observation epoch */
+                if (eph_only) continue;
                 print_obs_epoch(rtcm, label);
-                if (w_mid != NULL && g_multi_n == 2 && w_mid->stream_index >= 0 &&
-                    w_mid->stream_index < MAX_CLIENT_STREAMS) {
-                    store_epoch_snapshot(w_mid->stream_index, &rtcm->obs);
+                if (w_mid != NULL && g_base_n == 2 && w_mid->base_index >= 0 &&
+                    w_mid->base_index < MAX_CLIENT_STREAMS) {
+                    store_epoch_snapshot(w_mid->base_index, &rtcm->obs);
                     try_synth_virtual_obs();
                 }
             }
+            else if (ret == 2) {
+                /* Ephemeris updated -> merge into global pool (any role can feed) */
+                merge_eph_from_rtcm(rtcm);
+            }
             else if (ret == 5) {
+                /* Station / antenna info */
+                if (eph_only) continue;  /* eph-only streams must not bias midpoint */
                 print_station_msg(rtcm, label);
                 if (w_mid != NULL)
                     update_arp_midpoint_from_1005(rtcm, w_mid);
@@ -943,11 +1627,11 @@ static void stream_connect_forever(stream_worker_t *w)
         print_leave();
         run_client(s, &w->rtcm, lab, w);
         print_enter();
-        if (g_multi_n > 0 && w->stream_index >= 0 && w->stream_index < g_multi_n) {
-            g_arp_valid[w->stream_index] = 0;
+        if (g_base_n > 0 && w->base_index >= 0 && w->base_index < g_base_n) {
+            g_arp_valid[w->base_index] = 0;
             g_have_mid_print = 0;
             g_have_station_tx_epoch = 0;
-            g_epoch_snap[w->stream_index].n = 0;
+            g_epoch_snap[w->base_index].n = 0;
         }
         printf("[%s] disconnected from %s:%u, reconnecting...\n",
                lab, host, (unsigned)port);
@@ -971,17 +1655,21 @@ static void *stream_thread_proc(void *param)
 }
 #endif
 
-/* Parse: argv[1] must be -c, then repeating (-c host port [label])+ */
+/* Parse: argv[1] must be -c or -e, then repeating ((-c|-e) host port [label])+
+ *   -c <host> <port> [label]   base station (obs + ARP, plus eph if present)
+ *   -e <host> <port> [label]   broadcast-ephemeris-only stream (no obs/ARP) */
 static int parse_client_streams(int argc, char **argv, cli_stream_t *out, int max_n)
 {
     int i = 1, n = 0;
 
-    if (i >= argc || strcmp(argv[i], "-c") != 0)
+    if (i >= argc || (strcmp(argv[i], "-c") != 0 && strcmp(argv[i], "-e") != 0))
         return -1;
 
     while (i < argc) {
-        if (strcmp(argv[i], "-c") != 0)
-            return -1;
+        int eph_only;
+        if (strcmp(argv[i], "-c") == 0)      eph_only = 0;
+        else if (strcmp(argv[i], "-e") == 0) eph_only = 1;
+        else                                  return -1;
         i++;
         if (i >= argc)
             return -1;
@@ -995,7 +1683,8 @@ static int parse_client_streams(int argc, char **argv, cli_stream_t *out, int ma
             out[n].port = (unsigned short)p;
         }
         out[n].label = NULL;
-        if (i < argc && strcmp(argv[i], "-c") != 0)
+        out[n].eph_only = eph_only;
+        if (i < argc && strcmp(argv[i], "-c") != 0 && strcmp(argv[i], "-e") != 0)
             out[n].label = argv[i++];
         n++;
         if (n > max_n)
@@ -1008,12 +1697,16 @@ static int run_multi_client(int argc, char **argv)
 {
     cli_stream_t specs[MAX_CLIENT_STREAMS];
     stream_worker_t *workers = NULL;
-    int n, k, j;
+    int n, k, j, nbase = 0, neph = 0;
 
     n = parse_client_streams(argc, argv, specs, MAX_CLIENT_STREAMS);
     if (n <= 0) {
-        fprintf(stderr, "invalid -c arguments\n");
+        fprintf(stderr, "invalid -c/-e arguments\n");
         return -1;
+    }
+    for (k = 0; k < n; k++) {
+        if (specs[k].eph_only) neph++;
+        else                   nbase++;
     }
 
     /* stream_worker_t embeds rtcm_t (very large). N copies on stack overflows
@@ -1032,23 +1725,33 @@ static int run_multi_client(int argc, char **argv)
     }
 
     print_identity_hint();
-    printf("Client mode: %d TCP stream(s) in this process.\n", n);
-    if (n >= 2) {
-        printf("RTCM 1005 ARP from each stream -> midpoint ECEF; input MSM epochs are not printed.\n");
+    printf("Client mode: %d TCP stream(s) in this process (base=%d, eph-only=%d).\n",
+           n, nbase, neph);
+    if (nbase >= 2) {
+        printf("RTCM 1005 ARP from base streams -> midpoint ECEF; input MSM epochs are not printed.\n");
         printf("Synthetic midpoint RTCM (1005 + MSM7) is sent on TCP port %u (one client at a time).\n",
                (unsigned)RTCM_OUT_PORT);
     }
+    if (neph > 0)
+        printf("Eph-only stream(s) feed the global broadcast ephemeris pool (no obs/ARP used).\n");
     fflush(stdout);
 
     tracelevel(0);
 
     g_multi_n = n;
-    g_suppress_input_obs = (n >= 2) ? 1 : 0;
+    g_base_n  = nbase;
+    g_suppress_input_obs = (nbase >= 2) ? 1 : 0;
     memset(g_arp_valid, 0, sizeof(g_arp_valid));
     g_have_mid_print = 0;
     memset(g_epoch_snap, 0, sizeof(g_epoch_snap));
     g_have_synth_epoch = 0;
     g_have_station_tx_epoch = 0;
+
+    if (!init_global_nav()) {
+        fprintf(stderr, "init_global_nav failed (out of memory)\n");
+        free(workers);
+        return -1;
+    }
 
     if (!g_enc_inited) {
         if (!init_rtcm(&g_enc_rtcm) || !init_rtcm(&g_dec_rtcm)) {
@@ -1060,6 +1763,7 @@ static int run_multi_client(int argc, char **argv)
         g_dec_rtcm.outtype = 1;
         g_enc_inited = 1;
     }
+    init_amb_cache();
 
 #ifdef _WIN32
     if (!CreateThread(NULL, 0, rtcm_out_server_thread, NULL, 0, NULL))
@@ -1076,19 +1780,23 @@ static int run_multi_client(int argc, char **argv)
     }
 #endif
 
-    for (k = 0; k < n; k++) {
-        worker_prepare(&workers[k], &specs[k]);
-        workers[k].stream_index = k;
-        strncpy(g_stream_tag[k], worker_label(&workers[k]), sizeof(g_stream_tag[k]) - 1);
-        g_stream_tag[k][sizeof(g_stream_tag[k]) - 1] = '\0';
-        if (!init_rtcm(&workers[k].rtcm)) {
-            fprintf(stderr, "init_rtcm failed for stream %d\n", k);
-            for (j = 0; j < k; j++)
-                free_rtcm(&workers[j].rtcm);
-            free(workers);
-            return -1;
+    {
+        int bi = 0;
+        for (k = 0; k < n; k++) {
+            worker_prepare(&workers[k], &specs[k]);
+            workers[k].stream_index = k;
+            workers[k].base_index = specs[k].eph_only ? -1 : bi++;
+            strncpy(g_stream_tag[k], worker_label(&workers[k]), sizeof(g_stream_tag[k]) - 1);
+            g_stream_tag[k][sizeof(g_stream_tag[k]) - 1] = '\0';
+            if (!init_rtcm(&workers[k].rtcm)) {
+                fprintf(stderr, "init_rtcm failed for stream %d\n", k);
+                for (j = 0; j < k; j++)
+                    free_rtcm(&workers[j].rtcm);
+                free(workers);
+                return -1;
+            }
+            workers[k].rtcm.outtype = 1;
         }
-        workers[k].rtcm.outtype = 1;
     }
 
 #ifdef _WIN32
@@ -1213,8 +1921,11 @@ static void usage(void)
     fprintf(stderr,
             "usage:\n"
             "  ntrip_rtcm_obs [listen_port] [label]     TCP server (default port %d)\n"
-            "  ntrip_rtcm_obs -c <host> <port> [label] [-c <host> <port> [label] ...]\n"
-            "      TCP client(s); multiple -c run in one process (one thread each).\n",
+            "  ntrip_rtcm_obs (-c|-e) <host> <port> [label] [(-c|-e) <host> <port> [label] ...]\n"
+            "      -c   base station stream  (obs + ARP, eph also accepted)\n"
+            "      -e   broadcast-ephemeris-only stream (no obs/ARP used)\n"
+            "      Multiple streams run in one process (one thread each).\n"
+            "      Need exactly 2 base streams to enable virtual midpoint synthesis.\n",
             DEFAULT_PORT);
 }
 
@@ -1223,7 +1934,7 @@ int main(int argc, char **argv)
     unsigned short port = DEFAULT_PORT;
     const char *label = NULL;
 
-    if (argc >= 2 && strcmp(argv[1], "-c") == 0)
+    if (argc >= 2 && (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "-e") == 0))
         return run_multi_client(argc, argv) ? 1 : 0;
 
     if (argc >= 2) {
