@@ -1919,6 +1919,86 @@ static int decode_ssr7_head(rtcm_t *rtcm, int sys, int subtype, int *sync,
     return nsat;
 }
 
+/* decode SSR 7: satellite phase biases -------------------------------------*/
+static int decode_ssr7(rtcm_t *rtcm, int sys, int subtype)
+{
+    const uint8_t *sigs;
+    double udint,pbias[MAXCODE],stdpb[MAXCODE],yaw_ang,yaw_rate;
+    int i,j,k,type,mode,sync,iod,nsat,prn,sat,nbias,np,offp,dispe,mw;
+    int int_ind,wl_ind,disc;
+
+    type=getbitu(rtcm->buff,24,12);
+
+    if ((nsat=decode_ssr7_head(rtcm,sys,subtype,&sync,&iod,&udint,
+                               &dispe,&mw,&i))<0) {
+        trace(2,"rtcm3 %d length error: len=%d\n",type,rtcm->len);
+        return -1;
+    }
+    switch (sys) {
+        case SYS_GPS: np=6; offp=  0; sigs=ssr_sig_gps; break;
+        case SYS_GLO: np=5; offp=  0; sigs=ssr_sig_glo; break;
+        case SYS_GAL: np=6; offp=  0; sigs=ssr_sig_gal; break;
+        case SYS_QZS: np=4; offp=192; sigs=ssr_sig_qzs; break;
+        case SYS_CMP: np=6; offp=  0; sigs=ssr_sig_cmp; break;
+        case SYS_SBS: np=6; offp=120; sigs=ssr_sig_sbs; break;
+        default: return sync?0:10;
+    }
+    if (subtype>0) { /* IGS SSR */
+        np=6;
+        if      (sys==SYS_CMP) offp=0;
+        else if (sys==SYS_SBS) offp=119;
+    }
+    if (sys==SYS_CMP) {
+        rtcm->time=bdt2gpst(rtcm->time);
+    }
+    for (j=0;j<nsat&&i+np+22<=rtcm->len*8;j++) {
+        prn     =getbitu(rtcm->buff,i,np)+offp; i+=np;
+        nbias   =getbitu(rtcm->buff,i, 5);      i+= 5;
+        yaw_ang =getbitu(rtcm->buff,i, 9)*180.0/256.0;  i+= 9;
+        yaw_rate=getbits(rtcm->buff,i, 8)*180.0/8192.0; i+= 8;
+
+        for (k=0;k<MAXCODE;k++) {
+            pbias[k]=0.0;
+            stdpb[k]=0.0;
+        }
+        for (k=0;k<nbias&&i+32+(subtype==0?17:0)<=rtcm->len*8;k++) {
+            mode   =getbitu(rtcm->buff,i, 5); i+= 5;
+            int_ind=getbitu(rtcm->buff,i, 1); i+= 1;
+            wl_ind =getbitu(rtcm->buff,i, 2); i+= 2;
+            disc   =getbitu(rtcm->buff,i, 4); i+= 4;
+            (void)int_ind; (void)wl_ind; (void)disc;
+            if (mode < 32 && sigs[mode]) {
+                pbias[sigs[mode]-1]=getbits(rtcm->buff,i,20)*0.0001;
+            }
+            else {
+                trace(2,"rtcm3 %d not supported phase-bias mode: mode=%d\n",
+                      type,mode);
+            }
+            i+=20;
+            if (subtype==0) {
+                if (mode < 32 && sigs[mode])
+                    stdpb[sigs[mode]-1]=getbitu(rtcm->buff,i,17)*0.0001;
+                i+=17;
+            }
+        }
+        if (!(sat=satno(sys,prn))) {
+            trace(2,"rtcm3 %d satellite number error: prn=%d\n",type,prn);
+            continue;
+        }
+        rtcm->ssr[sat-1].t0 [5]=rtcm->time;
+        rtcm->ssr[sat-1].udi[5]=udint;
+        rtcm->ssr[sat-1].iod[5]=iod;
+        for (k=0;k<MAXCODE;k++) {
+            rtcm->ssr[sat-1].pbias[k]=pbias[k];
+            rtcm->ssr[sat-1].stdpb[k]=(float)stdpb[k];
+        }
+        rtcm->ssr[sat-1].yaw_ang =yaw_ang;
+        rtcm->ssr[sat-1].yaw_rate=yaw_rate;
+        rtcm->ssr[sat-1].update=1;
+    }
+    return sync?0:10;
+}
+
 /* get signal index ----------------------------------------------------------*/
 static void sigindex(int sys, const uint8_t *code, int n, const char *opt,
                      int *idx)
@@ -2477,42 +2557,42 @@ static int decode_type4076(rtcm_t *rtcm)
         case  23: return decode_ssr4(rtcm,SYS_GPS,subtype);
         case  24: return decode_ssr6(rtcm,SYS_GPS,subtype);
         case  25: return decode_ssr3(rtcm,SYS_GPS,subtype);
-        // case  26: return decode_ssr7(rtcm,SYS_GPS,subtype);
+        case  26: return decode_ssr7(rtcm,SYS_GPS,subtype);
         case  27: return decode_ssr5(rtcm,SYS_GPS,subtype);
         case  41: return decode_ssr1(rtcm,SYS_GLO,subtype);
         case  42: return decode_ssr2(rtcm,SYS_GLO,subtype);
         case  43: return decode_ssr4(rtcm,SYS_GLO,subtype);
         case  44: return decode_ssr6(rtcm,SYS_GLO,subtype);
         case  45: return decode_ssr3(rtcm,SYS_GLO,subtype);
-        // case  46: return decode_ssr7(rtcm,SYS_GLO,subtype);
+        case  46: return decode_ssr7(rtcm,SYS_GLO,subtype);
         case  47: return decode_ssr5(rtcm,SYS_GLO,subtype);
         case  61: return decode_ssr1(rtcm,SYS_GAL,subtype);
         case  62: return decode_ssr2(rtcm,SYS_GAL,subtype);
         case  63: return decode_ssr4(rtcm,SYS_GAL,subtype);
         case  64: return decode_ssr6(rtcm,SYS_GAL,subtype);
         case  65: return decode_ssr3(rtcm,SYS_GAL,subtype);
-        // case  66: return decode_ssr7(rtcm,SYS_GAL,subtype);
+        case  66: return decode_ssr7(rtcm,SYS_GAL,subtype);
         case  67: return decode_ssr5(rtcm,SYS_GAL,subtype);
         case  81: return decode_ssr1(rtcm,SYS_QZS,subtype);
         case  82: return decode_ssr2(rtcm,SYS_QZS,subtype);
         case  83: return decode_ssr4(rtcm,SYS_QZS,subtype);
         case  84: return decode_ssr6(rtcm,SYS_QZS,subtype);
         case  85: return decode_ssr3(rtcm,SYS_QZS,subtype);
-        // case  86: return decode_ssr7(rtcm,SYS_QZS,subtype);
+        case  86: return decode_ssr7(rtcm,SYS_QZS,subtype);
         case  87: return decode_ssr5(rtcm,SYS_QZS,subtype);
         case 101: return decode_ssr1(rtcm,SYS_CMP,subtype);
         case 102: return decode_ssr2(rtcm,SYS_CMP,subtype);
         case 103: return decode_ssr4(rtcm,SYS_CMP,subtype);
         case 104: return decode_ssr6(rtcm,SYS_CMP,subtype);
         case 105: return decode_ssr3(rtcm,SYS_CMP,subtype);
-        // case 106: return decode_ssr7(rtcm,SYS_CMP,subtype);
+        case 106: return decode_ssr7(rtcm,SYS_CMP,subtype);
         case 107: return decode_ssr5(rtcm,SYS_CMP,subtype);
         case 121: return decode_ssr1(rtcm,SYS_SBS,subtype);
         case 122: return decode_ssr2(rtcm,SYS_SBS,subtype);
         case 123: return decode_ssr4(rtcm,SYS_SBS,subtype);
         case 124: return decode_ssr6(rtcm,SYS_SBS,subtype);
         case 125: return decode_ssr3(rtcm,SYS_SBS,subtype);
-        // case 126: return decode_ssr7(rtcm,SYS_SBS,subtype);
+        case 126: return decode_ssr7(rtcm,SYS_SBS,subtype);
         case 127: return decode_ssr5(rtcm,SYS_SBS,subtype);
     }
     trace(2,"rtcm3 4076: unsupported message subtype=%d\n",subtype);
@@ -2660,10 +2740,12 @@ extern int decode_rtcm3(rtcm_t *rtcm)
         case 1261: ret=decode_ssr4(rtcm,SYS_CMP,0); break; /* draft */
         case 1262: ret=decode_ssr5(rtcm,SYS_CMP,0); break; /* draft */
         case 1263: ret=decode_ssr6(rtcm,SYS_CMP,0); break; /* draft */
-		// case 1265: ret=decode_ssr7(rtcm,SYS_GPS,0); break; /* tentative */
-		// case 1267: ret=decode_ssr7(rtcm,SYS_GAL,0);break; /* tentative */
-		// case 1268: ret=decode_ssr7(rtcm,SYS_QZS,0); /* tentative */
-        // case 1270: ret=decode_ssr7(rtcm,SYS_CMP,0);break; /* tentative */
+		case 1265: ret=decode_ssr7(rtcm,SYS_GPS,0); break; /* tentative */
+		case 1266: ret=decode_ssr7(rtcm,SYS_GLO,0); break; /* tentative */
+		case 1267: ret=decode_ssr7(rtcm,SYS_GAL,0);break; /* tentative */
+		case 1268: ret=decode_ssr7(rtcm,SYS_QZS,0); break; /* tentative */
+        case 1269: ret=decode_ssr7(rtcm,SYS_SBS,0);break; /* tentative */
+        case 1270: ret=decode_ssr7(rtcm,SYS_CMP,0);break; /* tentative */
         case 4073: ret=decode_type4073(rtcm); break;
         case 4076: ret=decode_type4076(rtcm); break;
 	}

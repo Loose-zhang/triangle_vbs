@@ -80,14 +80,14 @@ typedef struct {
     const char *host;
     unsigned short port;
     const char *label; /* NULL or argv; if NULL, use label_storage */
-    int eph_only;      /* -e <host> <port> [label]: feed broadcast eph only */
+    int eph_only;      /* -e <host> <port> [label]: feed BRDC/SSR only */
 } cli_stream_t;
 
 typedef struct {
     cli_stream_t s;
     char label_storage[64];
     int stream_index; /* 0..n-1 worker order (any role) */
-    int base_index;   /* 0..g_base_n-1 for base streams; -1 for eph-only */
+    int base_index;   /* 0..g_base_n-1 for base streams; -1 for correction-only */
     rtcm_t rtcm;
 } stream_worker_t;
 
@@ -106,8 +106,8 @@ static char g_stream_tag[MAX_CLIENT_STREAMS][64];
 static double g_last_mid_ecef[3];
 static int g_have_mid_print;
 
-/* Global broadcast ephemeris pool, shared by all worker threads.
- * Updated whenever any stream (base or eph-only) returns ret==2 from input_rtcm3().
+/* Global broadcast ephemeris + SSR pool, shared by all worker threads.
+ * Updated whenever any stream (base or correction-only) returns ret==2/10.
  * Read by synth_virt_obs_with_eph(). Protected by g_nav_lock. */
 static nav_t g_nav;
 static int g_nav_inited;
@@ -125,6 +125,7 @@ static gtime_t g_last_synth_epoch;
 static int g_have_synth_epoch;
 static gtime_t g_last_station_tx_epoch;
 static int g_have_station_tx_epoch;
+static int g_ssr_nmsg;
 
 static int g_suppress_input_obs;
 static rtcm_t g_enc_rtcm;
@@ -154,6 +155,18 @@ static void tx_send_buf(const uint8_t *p, int n)
     if (g_tx_conn != SOCK_INVALID)
         (void)send(g_tx_conn, (const char *)p, n, 0);
     rtklib_unlock(&g_tx_lock);
+}
+
+static int rtcm3_frame_nbytes(const rtcm_t *rtcm)
+{
+    if (!rtcm || rtcm->len <= 0 || rtcm->len + 3 > MAXRAWLEN) return 0;
+    return rtcm->len + 3; /* rtcm->len includes header+payload; add CRC24Q */
+}
+
+static void tx_forward_current_rtcm3(const rtcm_t *rtcm)
+{
+    int n = rtcm3_frame_nbytes(rtcm);
+    if (n > 0) tx_send_buf(rtcm->buff, n);
 }
 
 #ifdef _WIN32
@@ -328,6 +341,29 @@ static void merge_eph_from_rtcm(const rtcm_t *src)
     rtklib_unlock(&g_nav_lock);
 }
 
+/* Copy decoded SSR corrections from a worker into the global nav pool.
+ * SSRC00CNE0/CLK-style streams arrive as RTCM SSR/IGS SSR and input_rtcm3()
+ * reports them with ret==10. VTEC 1264 has no local nav_t representation here;
+ * its raw RTCM frame is still forwarded by tx_forward_current_rtcm3(). */
+static void merge_ssr_from_rtcm(const rtcm_t *src)
+{
+    int i, copied = 0;
+
+    if (!g_nav_inited || !src) return;
+    rtklib_lock(&g_nav_lock);
+    for (i = 0; i < MAXSAT; i++) {
+        const ssr_t *s = &src->ssr[i];
+        if (!s->t0[0].time && !s->t0[1].time && !s->t0[2].time &&
+            !s->t0[3].time && !s->t0[4].time && !s->t0[5].time) {
+            continue;
+        }
+        g_nav.ssr[i] = *s;
+        copied++;
+    }
+    if (copied > 0) g_ssr_nmsg++;
+    rtklib_unlock(&g_nav_lock);
+}
+
 /* True when at least one ephemeris of `sat` is in the pool. Cheap, no lock. */
 static int g_nav_has_sat(int sat)
 {
@@ -353,6 +389,17 @@ static int g_nav_n_total(void)
         if (g_nav.eph[i].sat) c++;
     for (i = 0; i < MAXPRNGLO; i++)
         if (g_nav.geph[i].sat) c++;
+    return c;
+}
+
+static int g_nav_ssr_orbclk_total(void)
+{
+    int i, c = 0;
+    if (!g_nav_inited) return 0;
+    for (i = 0; i < MAXSAT; i++) {
+        if (g_nav.ssr[i].t0[0].time && g_nav.ssr[i].t0[1].time)
+            c++;
+    }
     return c;
 }
 
@@ -1008,6 +1055,10 @@ static int build_virt_obs_with_eph(
     static double dts[2 * MAXOBS];
     static double var[MAXOBS];
     static int    svh[MAXOBS];
+    static double rs_brdc[6 * MAXOBS];
+    static double dts_brdc[2 * MAXOBS];
+    static double var_brdc[MAXOBS];
+    static int    svh_brdc[MAXOBS];
     static double res_A[MAXOBS], res_B[MAXOBS];
     static double tmp[MAXOBS];
 
@@ -1020,6 +1071,7 @@ static int build_virt_obs_with_eph(
     int i0, i1, j, j1, sat, sys, prn, nv = 0;
     double b = norm3diff(rA, rB);
     double azel[2];
+    int use_ssr = g_nav_ssr_orbclk_total() >= 4;
 
     if (!g_nav_inited) return 0;
     if (s0->n <= 0 || s1->n <= 0) return 0;
@@ -1029,9 +1081,16 @@ static int build_virt_obs_with_eph(
     ecef2pos(rB, posB);
     ecef2pos(rV, posV);
 
-    /* satposs handles transit-time iteration; needs P[0] or first valid P. */
+    /* satposs handles transit-time iteration; needs P[0] or first valid P.
+     * Prefer CoM-referenced SSR (SSRC00CNE0) when orbit+clock corrections
+     * are present, but keep a broadcast fallback for satellites without SSR. */
     rtklib_lock(&g_nav_lock);
-    satposs(s0->time, s0->data, s0->n, &g_nav, EPHOPT_BRDC, rs, dts, var, svh);
+    satposs(s0->time, s0->data, s0->n, &g_nav,
+            use_ssr ? EPHOPT_SSRCOM : EPHOPT_BRDC, rs, dts, var, svh);
+    if (use_ssr) {
+        satposs(s0->time, s0->data, s0->n, &g_nav, EPHOPT_BRDC,
+                rs_brdc, dts_brdc, var_brdc, svh_brdc);
+    }
 
     for (i0 = 0; i0 < s0->n; i0++) {
         const double *r_s = rs + 6 * i0;
@@ -1039,6 +1098,14 @@ static int build_virt_obs_with_eph(
         sat_geom_t *g = &g_geom_cache[i0];
         g->valid = 0;
         g->sat = s0->data[i0].sat;
+        if (use_ssr && svh[i0] && !svh_brdc[i0]) svh[i0] = 0;
+        if (use_ssr && r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) {
+            r_s = rs_brdc + 6 * i0;
+            dts[2 * i0] = dts_brdc[2 * i0];
+            dts[2 * i0 + 1] = dts_brdc[2 * i0 + 1];
+            var[i0] = var_brdc[i0];
+            svh[i0] = svh_brdc[i0];
+        }
         if (svh[i0]) continue;
         if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
 
@@ -1362,6 +1429,7 @@ static void try_synth_virtual_obs(void)
     int used_eph = 0;
     double clk_A = 0.0, clk_B = 0.0, rms_eps = 0.0;
     int nclk_A = 0, nclk_B = 0;
+    int ssr_n = 0;
 
     if (g_base_n != 2) return;
     if (!g_enc_inited) return;
@@ -1472,19 +1540,24 @@ static void try_synth_virtual_obs(void)
             dec_sta++;
     }
 
+    ssr_n = g_nav_ssr_orbclk_total();
+
     if (used_eph) {
-        printf("VRS [eph] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
+        printf("VRS [%s] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
                "d_clk=%+.3fm | rms((eps_A-eps_B)/2)=%.3fm | L: fix=%d float=%d drop=%d "
-               "refSwap=%d | obs=%d sta=%d err=%d\n",
+               "refSwap=%d | brdc=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
+               ssr_n >= 4 ? "ssr-com" : "brdc",
                (unsigned)RTCM_OUT_PORT, tx_agg_len, nv,
                clk_A, nclk_A, clk_B, nclk_B, clk_A - clk_B,
                rms_eps,
                g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch,
+               g_nav_n_total(), ssr_n, g_ssr_nmsg,
                dec_obs, dec_sta, dec_err);
     }
     else {
-        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d eph_n=%d | obs=%d sta=%d err=%d\n",
+        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d eph_n=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
                (unsigned)RTCM_OUT_PORT, tx_agg_len, nv, g_nav_n_total(),
+               ssr_n, g_ssr_nmsg,
                dec_obs, dec_sta, dec_err);
     }
     fflush(stdout);
@@ -1559,12 +1632,18 @@ static int run_client(sock_t cfd, rtcm_t *rtcm, const char *label, stream_worker
                 }
             }
             else if (ret == 2) {
-                /* Ephemeris updated -> merge into global pool (any role can feed) */
+                /* Broadcast ephemeris updated -> merge and forward as BRDC output. */
                 merge_eph_from_rtcm(rtcm);
+                tx_forward_current_rtcm3(rtcm);
+            }
+            else if (ret == 10) {
+                /* SSR corrections from streams such as SSRC00CNE0. */
+                merge_ssr_from_rtcm(rtcm);
+                tx_forward_current_rtcm3(rtcm);
             }
             else if (ret == 5) {
                 /* Station / antenna info */
-                if (eph_only) continue;  /* eph-only streams must not bias midpoint */
+                if (eph_only) continue;  /* correction-only streams must not bias midpoint */
                 print_station_msg(rtcm, label);
                 if (w_mid != NULL)
                     update_arp_midpoint_from_1005(rtcm, w_mid);
@@ -1657,7 +1736,7 @@ static void *stream_thread_proc(void *param)
 
 /* Parse: argv[1] must be -c or -e, then repeating ((-c|-e) host port [label])+
  *   -c <host> <port> [label]   base station (obs + ARP, plus eph if present)
- *   -e <host> <port> [label]   broadcast-ephemeris-only stream (no obs/ARP) */
+ *   -e <host> <port> [label]   corrections stream: BRDC/SSR only (no obs/ARP) */
 static int parse_client_streams(int argc, char **argv, cli_stream_t *out, int max_n)
 {
     int i = 1, n = 0;
@@ -1725,7 +1804,7 @@ static int run_multi_client(int argc, char **argv)
     }
 
     print_identity_hint();
-    printf("Client mode: %d TCP stream(s) in this process (base=%d, eph-only=%d).\n",
+    printf("Client mode: %d TCP stream(s) in this process (base=%d, correction-only=%d).\n",
            n, nbase, neph);
     if (nbase >= 2) {
         printf("RTCM 1005 ARP from base streams -> midpoint ECEF; input MSM epochs are not printed.\n");
@@ -1733,7 +1812,7 @@ static int run_multi_client(int argc, char **argv)
                (unsigned)RTCM_OUT_PORT);
     }
     if (neph > 0)
-        printf("Eph-only stream(s) feed the global broadcast ephemeris pool (no obs/ARP used).\n");
+        printf("Correction-only stream(s) feed and forward BRDC/SSR, e.g. SSRC00CNE0 (no obs/ARP used).\n");
     fflush(stdout);
 
     tracelevel(0);
@@ -1746,6 +1825,7 @@ static int run_multi_client(int argc, char **argv)
     memset(g_epoch_snap, 0, sizeof(g_epoch_snap));
     g_have_synth_epoch = 0;
     g_have_station_tx_epoch = 0;
+    g_ssr_nmsg = 0;
 
     if (!init_global_nav()) {
         fprintf(stderr, "init_global_nav failed (out of memory)\n");
@@ -1923,7 +2003,7 @@ static void usage(void)
             "  ntrip_rtcm_obs [listen_port] [label]     TCP server (default port %d)\n"
             "  ntrip_rtcm_obs (-c|-e) <host> <port> [label] [(-c|-e) <host> <port> [label] ...]\n"
             "      -c   base station stream  (obs + ARP, eph also accepted)\n"
-            "      -e   broadcast-ephemeris-only stream (no obs/ARP used)\n"
+            "      -e   BRDC/SSR correction stream, e.g. SSRC00CNE0 (no obs/ARP used)\n"
             "      Multiple streams run in one process (one thread each).\n"
             "      Need exactly 2 base streams to enable virtual midpoint synthesis.\n",
             DEFAULT_PORT);

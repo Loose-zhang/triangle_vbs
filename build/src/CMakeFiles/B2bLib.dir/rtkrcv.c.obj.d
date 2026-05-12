@@ -24,7 +24,9 @@ src/CMakeFiles/B2bLib.dir/rtkrcv.c.obj: \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/sys/types.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/sys/stat.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/_mingw_stat64.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/Windows.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winsock2.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/_mingw_unicode.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/windows.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/sdkddkver.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/excpt.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/lib/clang/22/include/stdarg.h \
@@ -43,7 +45,6 @@ src/CMakeFiles/B2bLib.dir/rtkrcv.c.obj: \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/concurrencysal.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/driverspecs.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winnt.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/_mingw_unicode.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/ctype.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/corecrt_wctype.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/apiset.h \
@@ -232,76 +233,22 @@ src/CMakeFiles/B2bLib.dir/rtkrcv.c.obj: \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winnetwk.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/wnnc.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/virtdisk.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/cderr.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/dde.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/ddeml.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/dlgs.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/lzexpand.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mmsystem.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mmsyscom.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mciapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mmiscapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mmiscapi2.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/playsoundapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mmeapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/timeapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/joystickapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/nb30.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpc.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcdce.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcdcep.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcnsi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcnterr.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcasync.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/shellapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winperf.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winsock.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/stralign.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/sec_api/stralign_s.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winsvc.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mcx.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/imm.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_ws1_undef.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/_timeval.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/_bsd_types.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/inaddr.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_socket_types.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_fd_types.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_ip_types.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_ip_mreq1.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_wsadata.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_xmitfile.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/ws2def.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_wsa_errnos.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/wincrypt.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/bcrypt.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/ncrypt.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/dpapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winefs.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winscard.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/wtypes.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcndr.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcnsip.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/rpcsal.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/ole2.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/objbase.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/combaseapi.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/wtypesbase.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/unknwnbase.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/objidlbase.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/cguid.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/objidl.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/unknwn.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/urlmon.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/oleidl.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/servprov.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/msxml.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/oaidl.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/propidl.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/oleauto.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winioctl.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winsmcrd.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winspool.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/prsht.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/commdlg.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/stralign.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/sec_api/stralign_s.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winsvc.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/mcx.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/imm.h \
+  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/qos.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/errno.h \
   E:/RTKLIB_demo5_b34i/vbs/include/rtklib.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/stdio.h \
@@ -320,8 +267,4 @@ src/CMakeFiles/B2bLib.dir/rtkrcv.c.obj: \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/stddef.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/lib/clang/22/include/__stddef_wchar_t.h \
   C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/lib/clang/22/include/__stddef_wint_t.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/winsock2.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/psdk_inc/_ws1_undef.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/ws2def.h \
-  C:/Users/lenovo/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260407-ucrt-x86_64/include/qos.h \
   E:/RTKLIB_demo5_b34i/vbs/include/vt.h
