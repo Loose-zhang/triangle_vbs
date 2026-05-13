@@ -1,0 +1,22 @@
+# CMake build directories
+/build/
+/ntrip_rtcm_obs/cmake-build/
+/ntrip_rtcm_obs/cmake-debug/
+
+# Compiler and linker outputs
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.bin
+*.out
+*.d
+
+# Visual Studio transient files
+*.tlog
+*.lastbuildstate
+.vs/

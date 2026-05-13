@@ -1,9 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"E:/RTKLIB_demo5_b34i/vbs/build/cmake_install.cmake",
-		"E:/RTKLIB_demo5_b34i/vbs/build/src/cmake_install.cmake",
-		"E:/RTKLIB_demo5_b34i/vbs/build/ntrip_rtcm_obs/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

@@ -1,1 +1,0 @@
-/usr/bin/cc -g -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/ntrip_rtcm_obs.dir/ntrip_rtcm_obs.c.o -o ntrip_rtcm_obs  ../src/libB2bLib.a -lm -lpthread

@@ -1,8 +1,0 @@
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/CMakeFiles/edit_cache.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/CMakeFiles/rebuild_cache.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/src/CMakeFiles/B2bLib.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/src/CMakeFiles/edit_cache.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/src/CMakeFiles/rebuild_cache.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/ntrip_rtcm_obs/CMakeFiles/ntrip_rtcm_obs.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/ntrip_rtcm_obs/CMakeFiles/edit_cache.dir
-/Users/mingsongz/download/triangle_vbs/ntrip_rtcm_obs/cmake-build/ntrip_rtcm_obs/CMakeFiles/rebuild_cache.dir

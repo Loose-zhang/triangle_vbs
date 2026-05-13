@@ -4,20 +4,24 @@
  * Usage:
  *   Server (wait for STRSVR to connect in):
  *     ntrip_rtcm_obs [listen_port] [label]
- *       listen_port — default 50001
- *   Client — one or more streams in ONE terminal (each has own decoder + thread):
- *     ntrip_rtcm_obs -c <host> <port> [label] [-c <host> <port> [label] ...]
+ *       listen_port - default 50001
+ *   Client - one or more streams in ONE terminal (each has own decoder + thread):
+ *     ntrip_rtcm_obs (-c|-e) <host> <port> [label] ...
+ *       -c : base station stream (obs + ARP; BRDC/SSR also accepted)
+ *       -e : correction-only stream (BRDC/SSR forwarded and merged; no obs/ARP)
  *       Example (two STRSVR servers on 51000 / 51001):
  *         ntrip_rtcm_obs -c 127.0.0.1 51000 BASE_A -c 127.0.0.1 51001 BASE_B
  *       Omit label to auto-use host:port as tag.
  *
  * Parses bytes with RTKLIB input_rtcm3():
- *   ret==1 — observation epoch (MSM / 1004 …): pseudorange P, carrier L
- *   ret==5 — station / antenna: includes RTCM 1005 (ARP ECEF), 1006 (+height),
+ *   ret==1  - observation epoch (MSM / 1004 etc.): pseudorange P, carrier L
+ *   ret==2  - broadcast ephemeris
+ *   ret==5  - station / antenna: includes RTCM 1005 (ARP ECEF), 1006 (+height),
+ *   ret==10 - SSR correction message
  *            1007/1008/1033 (antenna/rec), etc.
  *
  * Same STATION ID (e.g. 1660) on two bases:
- *   RTCM staid is only 12 bits — collisions are normal. Use separate -c streams,
+ *   RTCM staid is only 12 bits; collisions are normal. Use separate -c streams,
  *   different [label], and/or 1005/1006 ECEF to tell stations apart.
  *
  * Two streams (-c x2), aligned epochs (|dt|<=0.5 s), no ephemeris / no sat position:
@@ -25,10 +29,14 @@
  *     P_mid = sqrt( max(0, (P_1^2+P_2^2)/2 - b^2/4) )
  *   where P_1,P_2 are the two stations' pseudoranges (slant-range proxies;
  *   clock/iono residuals small vs. geometry on short baselines).
- *   Carrier uses the same Apollonius construction per signal directly in cycles:
+ *   Fallback carrier uses the same Apollonius construction directly in cycles:
  *   convert baseline b to cycles for that signal, keep L_i in cycles, and output
  *   L_mid in cycles.
  *   If either station lacks valid L for that signal, L_mid = 0.
+ *
+ * With BRDC/SSR available, VRS pseudorange uses satellite geometry, clock,
+ * Klobuchar iono and Saastamoinen tropo. Carrier uses an A/B double-difference
+ * ambiguity cache per (system, signal) to keep rover DD ambiguities integer.
  *----------------------------------------------------------------------------*/
 #include "rtklib.h"
 #include <stdio.h>
@@ -353,11 +361,55 @@ static void merge_ssr_from_rtcm(const rtcm_t *src)
     rtklib_lock(&g_nav_lock);
     for (i = 0; i < MAXSAT; i++) {
         const ssr_t *s = &src->ssr[i];
+        ssr_t *d = &g_nav.ssr[i];
         if (!s->t0[0].time && !s->t0[1].time && !s->t0[2].time &&
             !s->t0[3].time && !s->t0[4].time && !s->t0[5].time) {
             continue;
         }
-        g_nav.ssr[i] = *s;
+        if (s->t0[0].time) {
+            d->t0[0] = s->t0[0];
+            d->udi[0] = s->udi[0];
+            d->iod[0] = s->iod[0];
+            d->iode = s->iode;
+            d->iodcrc = s->iodcrc;
+            d->refd = s->refd;
+            memcpy(d->deph, s->deph, sizeof(d->deph));
+            memcpy(d->ddeph, s->ddeph, sizeof(d->ddeph));
+        }
+        if (s->t0[1].time) {
+            d->t0[1] = s->t0[1];
+            d->udi[1] = s->udi[1];
+            d->iod[1] = s->iod[1];
+            memcpy(d->dclk, s->dclk, sizeof(d->dclk));
+        }
+        if (s->t0[2].time) {
+            d->t0[2] = s->t0[2];
+            d->udi[2] = s->udi[2];
+            d->iod[2] = s->iod[2];
+            d->hrclk = s->hrclk;
+        }
+        if (s->t0[3].time) {
+            d->t0[3] = s->t0[3];
+            d->udi[3] = s->udi[3];
+            d->iod[3] = s->iod[3];
+            d->ura = s->ura;
+        }
+        if (s->t0[4].time) {
+            d->t0[4] = s->t0[4];
+            d->udi[4] = s->udi[4];
+            d->iod[4] = s->iod[4];
+            memcpy(d->cbias, s->cbias, sizeof(d->cbias));
+        }
+        if (s->t0[5].time) {
+            d->t0[5] = s->t0[5];
+            d->udi[5] = s->udi[5];
+            d->iod[5] = s->iod[5];
+            memcpy(d->pbias, s->pbias, sizeof(d->pbias));
+            memcpy(d->stdpb, s->stdpb, sizeof(d->stdpb));
+            d->yaw_ang = s->yaw_ang;
+            d->yaw_rate = s->yaw_rate;
+        }
+        d->update = 1;
         copied++;
     }
     if (copied > 0) g_ssr_nmsg++;
@@ -986,7 +1038,7 @@ static void transform_amb_on_ref_change(int sys, uint8_t code,
         dd_jnew = g_amb[j_new - 1][code_idx].dd_n;
     }
     else {
-        /* No bridge — invalidate everything for this (sys, code) and re-fix
+        /* No bridge: invalidate everything for this (sys, code) and re-fix
          * from scratch on the next iteration. */
         for (i = 0; i < MAXSAT; i++) {
             sat = i + 1;
@@ -1022,10 +1074,10 @@ static void transform_amb_on_ref_change(int sys, uint8_t code,
 }
 
 /* ------------------------------------------------------------------------- */
-/* Builder B: broadcast-ephemeris-aware VRS pseudorange.                      */
+/* Builder B: ephemeris-aware VRS pseudorange and DD-fixed carrier.           */
 /*                                                                            */
 /* For each satellite k present in BOTH base snapshots:                       */
-/*   1) sat pos r_s and clock dt_s via satposs() with broadcast eph           */
+/*   1) sat pos r_s and clock dt_s via satposs() with BRDC or SSR             */
 /*   2) sagnac-aware geometric ranges rho_A, rho_B, rho_V via geodist()       */
 /*   3) Klobuchar L1 iono and Saastamoinen tropo at A, B, V                   */
 /*                                                                            */
@@ -1040,7 +1092,7 @@ static void transform_amb_on_ref_change(int sys, uint8_t code,
 /*   c*dt_rcv_V = (c*dt_rcv_A + c*dt_rcv_B) / 2                               */
 /*   P_V = rho_V - c*dt_s + I_V + T_V + c*dt_rcv_V + 0.5*(eps_A + eps_B)      */
 /*                                                                            */
-/* Carrier still uses Apollonius (placeholder until phase upgrade).           */
+/* Carrier is shifted to the virtual point after A/B DD ambiguity fixing.     */
 /* Returns 1 on success (nv populated), 0 if not enough data/ephemeris.       */
 /* ------------------------------------------------------------------------- */
 static int build_virt_obs_with_eph(
@@ -1269,7 +1321,7 @@ static int build_virt_obs_with_eph(
                     eps_B = d1->P[j1]  - g->rho_B + CLIGHT * g->dts0
                           - g->ion_B - g->trp_B - clk_B;
                     if (fabs(eps_A - eps_B) > 30.0) {
-                        /* multipath/slip on this signal — skip whole signal */
+                        /* Multipath/slip on this signal: skip whole signal. */
                         continue;
                     }
                     sum_dd2 += (eps_A - eps_B) * (eps_A - eps_B);
@@ -1359,7 +1411,7 @@ static int build_virt_obs_with_eph(
 
                             if (a->valid && a->ref_sat == ref_sat &&
                                 fabs(dd_float - a->dd_n) < VRS_AMB_KEEP_THRES) {
-                                /* Cached fix still consistent — reuse. */
+                                /* Cached fix still consistent: reuse. */
                                 a->t_last = d0->time;
                             }
                             else {
@@ -1378,7 +1430,7 @@ static int build_virt_obs_with_eph(
                         }
 
                         if (!a->valid) {
-                            /* Float / unfixable — drop carrier for this (sat, code).
+                            /* Float/unfixable: drop carrier for this (sat, code).
                              * Keeps ALL output sats on the same averaged-formula
                              * convention so DD at the rover stays integer. */
                             g_qc_n_float++;
@@ -1789,7 +1841,7 @@ static int run_multi_client(int argc, char **argv)
     }
 
     /* stream_worker_t embeds rtcm_t (very large). N copies on stack overflows
-     * the default ~1MB thread stack — use heap (fixes silent crash / 0xC00000FD). */
+     * the default ~1MB thread stack; use heap (fixes silent crash / 0xC00000FD). */
     workers = (stream_worker_t *)calloc((size_t)n, sizeof(stream_worker_t));
     if (!workers) {
         fprintf(stderr, "out of memory for %d stream(s)\n", n);
