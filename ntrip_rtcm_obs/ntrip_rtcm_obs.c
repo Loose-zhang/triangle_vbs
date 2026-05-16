@@ -82,6 +82,14 @@ typedef int sock_t;
 #define OUT_VIRT_STAID  2999
 #define MAX_CLIENT_STREAMS 16
 #define VIRT_STATION_INTERVAL 10.0
+#define VRS_MAX_EPOCH_SKEW 0.001
+#define VRS_MAX_BASELINE_M 5000.0
+#define VRS_MIN_COMMON_FOR_UNION 4
+#define VRS_MAX_UNION_RMS_M 1.0
+#define VRS_MIN_CODE_BIAS_SATS 2
+#define VRS_MAX_CODE_BIAS_SIGMA_M 3.0
+#define VRS_MIN_PHASE_BIAS_SATS 2
+#define VRS_MAX_PHASE_BIAS_SIGMA_CYC 0.10
 #define STREAM_THREAD_STACK_SIZE (8u * 1024u * 1024u)
 
 typedef struct {
@@ -128,6 +136,125 @@ typedef struct {
     obsd_t data[MAXOBS];
 } epoch_snap_t;
 
+typedef enum {
+    SRC_NONE = 0,
+    SRC_A_ONLY,
+    SRC_B_ONLY,
+    SRC_COMMON
+} sat_source_t;
+
+typedef struct {
+    const epoch_snap_t *a;
+    const epoch_snap_t *b;
+    gtime_t time;
+    double dt;
+} epoch_pair_t;
+
+typedef struct {
+    int sat;
+    sat_source_t source;
+    int idx_a;
+    int idx_b;
+} sat_visibility_t;
+
+typedef struct {
+    sat_visibility_t items[MAXOBS * 2];
+    int n;
+    int n_a_only;
+    int n_b_only;
+    int n_common;
+} visibility_set_t;
+
+typedef struct {
+    obsd_t obs;
+    sat_source_t source;
+} virt_obs_t;
+
+typedef struct {
+    virt_obs_t data[MAXOBS * 2];
+    int n;
+    int n_a_only;
+    int n_b_only;
+    int n_common;
+} virt_epoch_t;
+
+typedef enum {
+    VRS_MODE_MUTE = 0,
+    VRS_MODE_FALLBACK,
+    VRS_MODE_COMMON_ONLY,
+    VRS_MODE_UNION
+} vrs_mode_t;
+
+typedef enum {
+    VRS_TARGET_MIDPOINT = 0,
+    VRS_TARGET_BASE_A
+} vrs_target_mode_t;
+
+typedef enum {
+    UNION_REASON_OK = 0,
+    UNION_REASON_NO_EPH,
+    UNION_REASON_BASELINE,
+    UNION_REASON_COMMON,
+    UNION_REASON_RESIDUAL,
+    UNION_REASON_NO_EXTRA
+} union_reason_t;
+
+typedef struct {
+    int valid;
+    int fixed;
+    double length_m;
+} baseline_state_t;
+
+typedef struct {
+    int clock_valid[7];
+    double clk_a_sys[7];
+    double clk_b_sys[7];
+    int n_a[7];
+    int n_b[7];
+} common_cal_t;
+
+typedef struct {
+    int clock_code_a_n[7][MAXCODE];
+    int clock_code_b_n[7][MAXCODE];
+    int residual_n[7][MAXCODE];
+    int residual_reject_n[7][MAXCODE];
+    double residual_med_a_m[7][MAXCODE];
+    double residual_med_b_m[7][MAXCODE];
+    double residual_med_halfdiff_m[7][MAXCODE];
+    double residual_rms_halfdiff_m[7][MAXCODE];
+    int residual_debiased_n;
+    double residual_rms_debiased_halfdiff_m;
+} code_resid_diag_t;
+
+typedef struct {
+    int code_valid[7][MAXCODE];
+    double code_bias_ab_m[7][MAXCODE]; /* B frame minus A frame */
+    double code_sigma_m[7][MAXCODE];
+    int code_n[7][MAXCODE];
+    int phase_valid[7][MAXCODE];
+    double phase_bias_ab_cyc[7][MAXCODE]; /* B-aligned frame minus A frame */
+    double phase_sigma_cyc[7][MAXCODE];
+    int phase_n[7][MAXCODE];
+} cross_source_bias_state_t;
+
+typedef struct {
+    vrs_mode_t mode;
+    union_reason_t reason;
+    int n_publish_extra;
+} publish_plan_t;
+
+typedef struct {
+    int enabled;
+    int n_common_p;
+    int n_common_l;
+    int n_self_p;
+    int n_self_l;
+    double rms_common_p_m;
+    double rms_common_l_cyc;
+    double rms_self_p_m;
+    double rms_self_l_cyc;
+} backsolve_qc_t;
+
 static epoch_snap_t g_epoch_snap[MAX_CLIENT_STREAMS];
 static gtime_t g_last_synth_epoch;
 static int g_have_synth_epoch;
@@ -136,6 +263,7 @@ static int g_have_station_tx_epoch;
 static int g_ssr_nmsg;
 
 static int g_suppress_input_obs;
+static vrs_target_mode_t g_target_mode = VRS_TARGET_MIDPOINT;
 static rtcm_t g_enc_rtcm;
 static rtcm_t g_dec_rtcm;
 static int g_enc_inited;
@@ -611,8 +739,54 @@ static void store_epoch_snapshot(int sidx, const obs_t *obs)
     print_leave();
 }
 
-/* RTCM 3 MSM7 decode requires nsat*nsig <= 64; keep constellations small enough. */
-#define MSM_MAX_SATS_PER_SYS 18
+static int make_epoch_pair(const epoch_snap_t *a, const epoch_snap_t *b,
+                           epoch_pair_t *pair)
+{
+    double dt;
+
+    if (!a || !b || !pair) return 0;
+    if (a->n <= 0 || b->n <= 0) return 0;
+    dt = timediff(a->time, b->time);
+    if (fabs(dt) > VRS_MAX_EPOCH_SKEW) return 0;
+
+    pair->a = a;
+    pair->b = b;
+    pair->time = a->time;
+    pair->dt = dt;
+    return 1;
+}
+
+static void classify_visibility(const epoch_pair_t *pair, visibility_set_t *set)
+{
+    int i, idx_b;
+
+    memset(set, 0, sizeof(*set));
+    for (i = 0; i < pair->a->n && set->n < (int)(MAXOBS * 2); i++) {
+        sat_visibility_t *v = &set->items[set->n++];
+        idx_b = find_sat_in_snap(pair->b, pair->a->data[i].sat);
+        v->sat = pair->a->data[i].sat;
+        v->idx_a = i;
+        v->idx_b = idx_b;
+        if (idx_b >= 0) {
+            v->source = SRC_COMMON;
+            set->n_common++;
+        }
+        else {
+            v->source = SRC_A_ONLY;
+            set->n_a_only++;
+        }
+    }
+    for (i = 0; i < pair->b->n && set->n < (int)(MAXOBS * 2); i++) {
+        sat_visibility_t *v;
+        if (find_sat_in_snap(pair->a, pair->b->data[i].sat) >= 0) continue;
+        v = &set->items[set->n++];
+        v->sat = pair->b->data[i].sat;
+        v->idx_a = -1;
+        v->idx_b = i;
+        v->source = SRC_B_ONLY;
+        set->n_b_only++;
+    }
+}
 
 static const char **msm_sig_table(int sys)
 {
@@ -674,20 +848,30 @@ static uint8_t msm_remap_obs_code(int sys, uint8_t code)
     return code;
 }
 
+static int msm_remap_preserves_observable(int sys, uint8_t from, uint8_t to, int fcn)
+{
+    double fq_from, fq_to;
+
+    if (sys == SYS_CMP &&
+        ((from == CODE_L1I && to == CODE_L2I) ||
+         (from == CODE_L1Q && to == CODE_L2Q))) {
+        return 1; /* legacy B1I/B1Q aliases used by older RTKLIB decoders */
+    }
+    fq_from = code2freq(sys, from, fcn);
+    fq_to = code2freq(sys, to, fcn);
+    return fq_from > 0.0 && fq_to > 0.0 && fabs(fq_from - fq_to) <= 1.0;
+}
+
 static void remap_obs_codes_for_msm7(obsd_t *data, int n)
 {
     int i, j, prn, sys;
     uint8_t c;
-    double fq;
 
     for (i = 0; i < n; i++) {
         sys = satsys(data[i].sat, &prn);
         for (j = 0; j < NFREQ + NEXOBS; j++) {
-            double L_was;
-
             if (data[i].code[j] == CODE_NONE) continue;
             if (data[i].P[j] == 0.0 && data[i].L[j] == 0.0) continue;
-            L_was = data[i].L[j];
             c = msm_remap_obs_code(sys, data[i].code[j]);
             if (c == CODE_NONE || !obs_code_in_msm_table(sys, c)) {
                 data[i].code[j] = CODE_NONE;
@@ -695,10 +879,13 @@ static void remap_obs_codes_for_msm7(obsd_t *data, int n)
                 continue;
             }
             if (c != data[i].code[j]) {
+                if (!msm_remap_preserves_observable(sys, data[i].code[j], c,
+                                                    data[i].freq)) {
+                    data[i].code[j] = CODE_NONE;
+                    data[i].P[j] = data[i].L[j] = 0.0;
+                    continue;
+                }
                 data[i].code[j] = c;
-                fq = code2freq(sys, c, data[i].freq);
-                if (fq > 0.0 && data[i].P[j] != 0.0 && L_was != 0.0)
-                    data[i].L[j] = data[i].P[j] / (CLIGHT / fq);
             }
         }
     }
@@ -718,19 +905,17 @@ static int sys_bit_index(int sys)
     }
 }
 
-static void cap_rows_per_gnss_sys(obsd_t *data, int n, int max_per_sys)
+static const char *sys_bit_name(int sb)
 {
-    int i, prn, sys, bi;
-    int cnt[7];
-
-    memset(cnt, 0, sizeof(cnt));
-    for (i = 0; i < n; i++) {
-        sys = satsys(data[i].sat, &prn);
-        bi = sys_bit_index(sys);
-        if (bi < 0) continue;
-        cnt[bi]++;
-        if (cnt[bi] > max_per_sys)
-            memset(&data[i], 0, sizeof(data[i]));
+    switch (sb) {
+    case 0: return "G";
+    case 1: return "R";
+    case 2: return "E";
+    case 3: return "J";
+    case 4: return "S";
+    case 5: return "C";
+    case 6: return "I";
+    default: return "?";
     }
 }
 
@@ -757,7 +942,6 @@ static int compress_obs_rows(obsd_t *data, int n)
 static void prepare_virt_for_msm7(obsd_t *virt, int *pnv)
 {
     remap_obs_codes_for_msm7(virt, *pnv);
-    cap_rows_per_gnss_sys(virt, *pnv, MSM_MAX_SATS_PER_SYS);
     /* Keep all per-frequency slots that passed remap (e.g. dual-frequency for
      * RTK/PPP). build_msm_chunks() splits by nsat*nsig<=64. */
     *pnv = compress_obs_rows(virt, *pnv);
@@ -850,20 +1034,22 @@ static int build_msm_chunks(const obs_t *obs, msm_chunk_t *chunks, int max_chunk
 /* Used as fallback when broadcast ephemeris is not yet available.            */
 /* ------------------------------------------------------------------------- */
 static int build_virt_obs_apollonius(
-    const epoch_snap_t *s0, const epoch_snap_t *s1,
+    const epoch_pair_t *pair, const visibility_set_t *vis,
     double b, obsd_t *virt, int *pnv)
 {
-    int i0, i1, j, j1, sat, prn, sys, nv = 0;
+    const epoch_snap_t *s0 = pair->a, *s1 = pair->b;
+    int vi, i0, i1, j, j1, sat, prn, sys, nv = 0;
     double P0, P1, Pm_sq, Pm, freq, lam, bcyc, L0, L1, Lm_sq;
     const obsd_t *d0, *d1;
 
-    for (i0 = 0; i0 < s0->n && nv < MAXOBS; i0++) {
+    for (vi = 0; vi < vis->n && nv < MAXOBS; vi++) {
         obsd_t vd;
         int any = 0;
+        if (vis->items[vi].source != SRC_COMMON) continue;
+        i0 = vis->items[vi].idx_a;
+        i1 = vis->items[vi].idx_b;
         d0 = &s0->data[i0];
         sat = d0->sat;
-        i1 = find_sat_in_snap(s1, sat);
-        if (i1 < 0) continue;
         d1 = &s1->data[i1];
 
         memset(&vd, 0, sizeof(vd));
@@ -920,6 +1106,161 @@ typedef struct {
 } sat_geom_t;
 
 static sat_geom_t g_geom_cache[MAXOBS];
+
+typedef struct {
+    int sat;
+    int valid;
+    double dts0;
+    double rho_src, rho_v;
+    double ion_src, ion_v;
+    double trp_src, trp_v;
+} single_geom_t;
+
+/* Prepare geometry for the current common-only VRS path. Phase 1 deliberately
+ * keeps the original A-indexed cache layout so downstream math stays unchanged
+ * while geometry preparation gains an explicit module boundary. */
+static int prepare_common_geometry(
+    const epoch_pair_t *pair,
+    const double rA[3], const double rB[3], const double rV[3],
+    sat_geom_t *geom)
+{
+    static double rs[6 * MAXOBS];
+    static double dts[2 * MAXOBS];
+    static double var[MAXOBS];
+    static int    svh[MAXOBS];
+    static double rs_brdc[6 * MAXOBS];
+    static double dts_brdc[2 * MAXOBS];
+    static double var_brdc[MAXOBS];
+    static int    svh_brdc[MAXOBS];
+
+    const epoch_snap_t *s0 = pair->a;
+    double posA[3], posB[3], posV[3];
+    double e[3], azel[2];
+    int i0;
+    int use_ssr = g_nav_ssr_orbclk_total() >= 4;
+
+    if (!g_nav_inited || !pair || s0->n <= 0 || s0->n > MAXOBS) return 0;
+
+    ecef2pos(rA, posA);
+    ecef2pos(rB, posB);
+    ecef2pos(rV, posV);
+
+    rtklib_lock(&g_nav_lock);
+    satposs(pair->time, s0->data, s0->n, &g_nav,
+            use_ssr ? EPHOPT_SSRCOM : EPHOPT_BRDC, rs, dts, var, svh);
+    if (use_ssr) {
+        satposs(pair->time, s0->data, s0->n, &g_nav, EPHOPT_BRDC,
+                rs_brdc, dts_brdc, var_brdc, svh_brdc);
+    }
+
+    for (i0 = 0; i0 < s0->n; i0++) {
+        const double *r_s = rs + 6 * i0;
+        const double *ion_p;
+        sat_geom_t *g = &geom[i0];
+        g->valid = 0;
+        g->sat = s0->data[i0].sat;
+        if (use_ssr && svh[i0] && !svh_brdc[i0]) svh[i0] = 0;
+        if (use_ssr && r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) {
+            r_s = rs_brdc + 6 * i0;
+            dts[2 * i0] = dts_brdc[2 * i0];
+            dts[2 * i0 + 1] = dts_brdc[2 * i0 + 1];
+            var[i0] = var_brdc[i0];
+            svh[i0] = svh_brdc[i0];
+        }
+        if (svh[i0]) continue;
+        if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
+
+        g->rho_A = geodist(r_s, rA, e); satazel(posA, e, azel);
+        if (g->rho_A <= 0.0 || azel[1] < 5.0 * D2R) continue;
+        g->elev_A = azel[1];
+        g->ion_A = ionmodel(pair->time, g_nav.ion_gps, posA, azel);
+        g->trp_A = tropmodel(pair->time, posA, azel, 0.7);
+        if (satsys(g->sat, NULL) == SYS_CMP)
+            g->ion_A = ionmodel(pair->time, g_nav.ion_cmp, posA, azel);
+
+        g->rho_B = geodist(r_s, rB, e); satazel(posB, e, azel);
+        if (g->rho_B <= 0.0 || azel[1] < 5.0 * D2R) continue;
+        ion_p = (satsys(g->sat, NULL) == SYS_CMP) ? g_nav.ion_cmp : g_nav.ion_gps;
+        g->ion_B = ionmodel(pair->time, ion_p, posB, azel);
+        g->trp_B = tropmodel(pair->time, posB, azel, 0.7);
+
+        g->rho_V = geodist(r_s, rV, e); satazel(posV, e, azel);
+        if (g->rho_V <= 0.0) continue;
+        g->ion_V = ionmodel(pair->time, ion_p, posV, azel);
+        g->trp_V = tropmodel(pair->time, posV, azel, 0.7);
+
+        g->dts0 = dts[2 * i0];
+        g->valid = 1;
+    }
+    rtklib_unlock(&g_nav_lock);
+    return 1;
+}
+
+static int prepare_single_source_geometry(
+    const epoch_snap_t *src,
+    const double r_src[3], const double r_v[3],
+    single_geom_t *geom)
+{
+    static double rs[6 * MAXOBS];
+    static double dts[2 * MAXOBS];
+    static double var[MAXOBS];
+    static int    svh[MAXOBS];
+    static double rs_brdc[6 * MAXOBS];
+    static double dts_brdc[2 * MAXOBS];
+    static double var_brdc[MAXOBS];
+    static int    svh_brdc[MAXOBS];
+
+    double pos_src[3], pos_v[3];
+    double e[3], azel[2];
+    int i;
+    int use_ssr = g_nav_ssr_orbclk_total() >= 4;
+
+    if (!g_nav_inited || !src || src->n <= 0 || src->n > MAXOBS) return 0;
+
+    ecef2pos(r_src, pos_src);
+    ecef2pos(r_v, pos_v);
+
+    rtklib_lock(&g_nav_lock);
+    satposs(src->time, src->data, src->n, &g_nav,
+            use_ssr ? EPHOPT_SSRCOM : EPHOPT_BRDC, rs, dts, var, svh);
+    if (use_ssr) {
+        satposs(src->time, src->data, src->n, &g_nav, EPHOPT_BRDC,
+                rs_brdc, dts_brdc, var_brdc, svh_brdc);
+    }
+
+    for (i = 0; i < src->n; i++) {
+        const double *r_s = rs + 6 * i;
+        const double *ion_p;
+        single_geom_t *g = &geom[i];
+        g->valid = 0;
+        g->sat = src->data[i].sat;
+        if (use_ssr && svh[i] && !svh_brdc[i]) svh[i] = 0;
+        if (use_ssr && r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) {
+            r_s = rs_brdc + 6 * i;
+            dts[2 * i] = dts_brdc[2 * i];
+            dts[2 * i + 1] = dts_brdc[2 * i + 1];
+            var[i] = var_brdc[i];
+            svh[i] = svh_brdc[i];
+        }
+        if (svh[i]) continue;
+        if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
+
+        g->rho_src = geodist(r_s, r_src, e); satazel(pos_src, e, azel);
+        if (g->rho_src <= 0.0 || azel[1] < 5.0 * D2R) continue;
+        ion_p = (satsys(g->sat, NULL) == SYS_CMP) ? g_nav.ion_cmp : g_nav.ion_gps;
+        g->ion_src = ionmodel(src->time, ion_p, pos_src, azel);
+        g->trp_src = tropmodel(src->time, pos_src, azel, 0.7);
+
+        g->rho_v = geodist(r_s, r_v, e); satazel(pos_v, e, azel);
+        if (g->rho_v <= 0.0) continue;
+        g->ion_v = ionmodel(src->time, ion_p, pos_v, azel);
+        g->trp_v = tropmodel(src->time, pos_v, azel, 0.7);
+        g->dts0 = dts[2 * i];
+        g->valid = 1;
+    }
+    rtklib_unlock(&g_nav_lock);
+    return 1;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Phase-side: A-B double-difference integer-ambiguity cache.                 */
@@ -1081,10 +1422,10 @@ static void transform_amb_on_ref_change(int sys, uint8_t code,
 /*   2) sagnac-aware geometric ranges rho_A, rho_B, rho_V via geodist()       */
 /*   3) Klobuchar L1 iono and Saastamoinen tropo at A, B, V                   */
 /*                                                                            */
-/* Per-base receiver clock (m) is estimated as:                               */
+/* Per-base receiver clock (m) is estimated per constellation as:             */
 /*   c*dt_rcv_i = median over sats of (P_i - rho_i + c*dt_s - I_i - T_i)      */
-/* using the first valid pseudorange of each satellite (single-frequency for  */
-/* clock, robust enough for code-level VRS).                                  */
+/* using the first valid pseudorange of each satellite. This avoids folding    */
+/* inter-system offsets into one mixed receiver-clock estimate.                */
 /*                                                                            */
 /* For each (sat, signal):                                                    */
 /*   eps_A = P_A - rho_A + c*dt_s - I_A - T_A - c*dt_rcv_A   [code residual]  */
@@ -1096,124 +1437,99 @@ static void transform_amb_on_ref_change(int sys, uint8_t code,
 /* Returns 1 on success (nv populated), 0 if not enough data/ephemeris.       */
 /* ------------------------------------------------------------------------- */
 static int build_virt_obs_with_eph(
-    const epoch_snap_t *s0, const epoch_snap_t *s1,
+    const epoch_pair_t *pair, const visibility_set_t *vis,
     const double rA[3], const double rB[3], const double rV[3],
     obsd_t *virt, int *pnv,
     double *clk_A_out, double *clk_B_out,
     int *nclk_A_out, int *nclk_B_out,
-    double *rms_eps_out)
+    double *rms_eps_out,
+    common_cal_t *cal_out,
+    code_resid_diag_t *diag_out)
 {
-    static double rs[6 * MAXOBS];
-    static double dts[2 * MAXOBS];
-    static double var[MAXOBS];
-    static int    svh[MAXOBS];
-    static double rs_brdc[6 * MAXOBS];
-    static double dts_brdc[2 * MAXOBS];
-    static double var_brdc[MAXOBS];
-    static int    svh_brdc[MAXOBS];
-    static double res_A[MAXOBS], res_B[MAXOBS];
+    static double res_A[7][MAXOBS], res_B[7][MAXOBS];
+    static double code_eps_A[7][MAXCODE][MAXOBS];
+    static double code_eps_B[7][MAXCODE][MAXOBS];
+    static double code_halfdiff[7][MAXCODE][MAXOBS];
+    static int code_eps_n[7][MAXCODE];
     static double tmp[MAXOBS];
 
-    double posA[3], posB[3], posV[3];
-    double e[3];
-    double clk_A = 0.0, clk_B = 0.0, clk_V;
+    const epoch_snap_t *s0 = pair->a, *s1 = pair->b;
+    double clk_A = 0.0, clk_B = 0.0;
+    double clk_A_sys[7] = {0}, clk_B_sys[7] = {0};
+    int clk_valid[7] = {0};
     double sum_dd2 = 0.0;
     int n_dd = 0;
-    int n_res_A = 0, n_res_B = 0;
-    int i0, i1, j, j1, sat, sys, prn, nv = 0;
-    double b = norm3diff(rA, rB);
-    double azel[2];
-    int use_ssr = g_nav_ssr_orbclk_total() >= 4;
+    int n_res_A[7] = {0}, n_res_B[7] = {0};
+    int n_res_A_total = 0, n_res_B_total = 0, n_clk_sys = 0;
+    int vi, i0, i1, j, j1, sat, sys, prn, nv = 0;
 
+    if (cal_out) memset(cal_out, 0, sizeof(*cal_out));
+    if (diag_out) memset(diag_out, 0, sizeof(*diag_out));
+    memset(code_eps_n, 0, sizeof(code_eps_n));
     if (!g_nav_inited) return 0;
     if (s0->n <= 0 || s1->n <= 0) return 0;
     if (s0->n > MAXOBS) return 0;
-
-    ecef2pos(rA, posA);
-    ecef2pos(rB, posB);
-    ecef2pos(rV, posV);
-
-    /* satposs handles transit-time iteration; needs P[0] or first valid P.
-     * Prefer CoM-referenced SSR (SSRC00CNE0) when orbit+clock corrections
-     * are present, but keep a broadcast fallback for satellites without SSR. */
-    rtklib_lock(&g_nav_lock);
-    satposs(s0->time, s0->data, s0->n, &g_nav,
-            use_ssr ? EPHOPT_SSRCOM : EPHOPT_BRDC, rs, dts, var, svh);
-    if (use_ssr) {
-        satposs(s0->time, s0->data, s0->n, &g_nav, EPHOPT_BRDC,
-                rs_brdc, dts_brdc, var_brdc, svh_brdc);
-    }
-
-    for (i0 = 0; i0 < s0->n; i0++) {
-        const double *r_s = rs + 6 * i0;
-        const double *ion_p;
-        sat_geom_t *g = &g_geom_cache[i0];
-        g->valid = 0;
-        g->sat = s0->data[i0].sat;
-        if (use_ssr && svh[i0] && !svh_brdc[i0]) svh[i0] = 0;
-        if (use_ssr && r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) {
-            r_s = rs_brdc + 6 * i0;
-            dts[2 * i0] = dts_brdc[2 * i0];
-            dts[2 * i0 + 1] = dts_brdc[2 * i0 + 1];
-            var[i0] = var_brdc[i0];
-            svh[i0] = svh_brdc[i0];
-        }
-        if (svh[i0]) continue;
-        if (r_s[0] == 0.0 && r_s[1] == 0.0 && r_s[2] == 0.0) continue;
-
-        g->rho_A = geodist(r_s, rA, e); satazel(posA, e, azel);
-        if (g->rho_A <= 0.0 || azel[1] < 5.0 * D2R) continue;
-        g->elev_A = azel[1];
-        g->ion_A = ionmodel(s0->time, g_nav.ion_gps, posA, azel);
-        g->trp_A = tropmodel(s0->time, posA, azel, 0.7);
-        if (satsys(g->sat, NULL) == SYS_CMP)
-            g->ion_A = ionmodel(s0->time, g_nav.ion_cmp, posA, azel);
-
-        g->rho_B = geodist(r_s, rB, e); satazel(posB, e, azel);
-        if (g->rho_B <= 0.0 || azel[1] < 5.0 * D2R) continue;
-        ion_p = (satsys(g->sat, NULL) == SYS_CMP) ? g_nav.ion_cmp : g_nav.ion_gps;
-        g->ion_B = ionmodel(s0->time, ion_p, posB, azel);
-        g->trp_B = tropmodel(s0->time, posB, azel, 0.7);
-
-        g->rho_V = geodist(r_s, rV, e); satazel(posV, e, azel);
-        if (g->rho_V <= 0.0) continue;
-        g->ion_V = ionmodel(s0->time, ion_p, posV, azel);
-        g->trp_V = tropmodel(s0->time, posV, azel, 0.7);
-
-        g->dts0 = dts[2 * i0];
-        g->valid = 1;
-    }
-    rtklib_unlock(&g_nav_lock);
+    if (!prepare_common_geometry(pair, rA, rB, rV, g_geom_cache)) return 0;
 
     /* Pass 1: per-sat clock residuals using each base's first valid P. */
-    for (i0 = 0; i0 < s0->n; i0++) {
-        const obsd_t *d0 = &s0->data[i0];
+    for (vi = 0; vi < vis->n; vi++) {
+        const obsd_t *d0;
         const obsd_t *d1;
-        const sat_geom_t *g = &g_geom_cache[i0];
+        const sat_geom_t *g;
         double P0 = 0.0, P1 = 0.0;
+        uint8_t code0 = CODE_NONE, code1 = CODE_NONE;
+        int sb;
 
+        if (vis->items[vi].source != SRC_COMMON) continue;
+        i0 = vis->items[vi].idx_a;
+        i1 = vis->items[vi].idx_b;
+        d0 = &s0->data[i0];
+        g = &g_geom_cache[i0];
         if (!g->valid) continue;
-        i1 = find_sat_in_snap(s1, d0->sat);
-        if (i1 < 0) continue;
         d1 = &s1->data[i1];
+        sb = sys_bit_index(satsys(d0->sat, NULL));
+        if (sb < 0) continue;
 
         for (j = 0; j < NFREQ + NEXOBS; j++) {
-            if (P0 == 0.0 && d0->P[j] > 0.0) P0 = d0->P[j];
-            if (P1 == 0.0 && d1->P[j] > 0.0) P1 = d1->P[j];
+            if (P0 == 0.0 && d0->P[j] > 0.0) {
+                P0 = d0->P[j];
+                code0 = d0->code[j];
+            }
+            if (P1 == 0.0 && d1->P[j] > 0.0) {
+                P1 = d1->P[j];
+                code1 = d1->code[j];
+            }
             if (P0 != 0.0 && P1 != 0.0) break;
         }
-        if (P0 > 0.0)
-            res_A[n_res_A++] = P0 - g->rho_A + CLIGHT * g->dts0 - g->ion_A - g->trp_A;
-        if (P1 > 0.0)
-            res_B[n_res_B++] = P1 - g->rho_B + CLIGHT * g->dts0 - g->ion_B - g->trp_B;
+        if (P0 > 0.0) {
+            res_A[sb][n_res_A[sb]++] =
+                P0 - g->rho_A + CLIGHT * g->dts0 - g->ion_A - g->trp_A;
+            if (diag_out && code0 != CODE_NONE)
+                diag_out->clock_code_a_n[sb][code0 - 1]++;
+        }
+        if (P1 > 0.0) {
+            res_B[sb][n_res_B[sb]++] =
+                P1 - g->rho_B + CLIGHT * g->dts0 - g->ion_B - g->trp_B;
+            if (diag_out && code1 != CODE_NONE)
+                diag_out->clock_code_b_n[sb][code1 - 1]++;
+        }
     }
-    if (n_res_A < 4 || n_res_B < 4) return 0;
-
-    memcpy(tmp, res_A, (size_t)n_res_A * sizeof(double));
-    clk_A = median_of(tmp, n_res_A);
-    memcpy(tmp, res_B, (size_t)n_res_B * sizeof(double));
-    clk_B = median_of(tmp, n_res_B);
-    clk_V = 0.5 * (clk_A + clk_B);
+    for (j = 0; j < 7; j++) {
+        if (n_res_A[j] < 4 || n_res_B[j] < 4) continue;
+        memcpy(tmp, res_A[j], (size_t)n_res_A[j] * sizeof(double));
+        clk_A_sys[j] = median_of(tmp, n_res_A[j]);
+        memcpy(tmp, res_B[j], (size_t)n_res_B[j] * sizeof(double));
+        clk_B_sys[j] = median_of(tmp, n_res_B[j]);
+        clk_A += clk_A_sys[j];
+        clk_B += clk_B_sys[j];
+        n_res_A_total += n_res_A[j];
+        n_res_B_total += n_res_B[j];
+        clk_valid[j] = 1;
+        n_clk_sys++;
+    }
+    if (n_clk_sys <= 0) return 0;
+    clk_A /= n_clk_sys;
+    clk_B /= n_clk_sys;
 
     /* ----- Pass 2a: pre-scan codes seen this epoch and refresh ref sats ---- */
     {
@@ -1221,9 +1537,12 @@ static int build_virt_obs_with_eph(
         int sysmap[7] = {SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_SBS, SYS_CMP, SYS_IRN};
         int si, ci;
         memset(seen_sys_code, 0, sizeof(seen_sys_code));
-        for (i0 = 0; i0 < s0->n; i0++) {
-            const obsd_t *d0 = &s0->data[i0];
+        for (vi = 0; vi < vis->n; vi++) {
+            const obsd_t *d0;
             int sb;
+            if (vis->items[vi].source != SRC_COMMON) continue;
+            i0 = vis->items[vi].idx_a;
+            d0 = &s0->data[i0];
             if (!g_geom_cache[i0].valid) continue;
             sb = sys_bit_index(satsys(d0->sat, &prn));
             if (sb < 0) continue;
@@ -1285,23 +1604,26 @@ static int build_virt_obs_with_eph(
             if (s0->data[i0].sat > 0 && s0->data[i0].sat <= MAXSAT)
                 sat_to_i0[s0->data[i0].sat] = i0;
 
-        for (i0 = 0; i0 < s0->n && nv < MAXOBS; i0++) {
-            const obsd_t *d0 = &s0->data[i0];
+        for (vi = 0; vi < vis->n && nv < MAXOBS; vi++) {
+            const obsd_t *d0;
             const obsd_t *d1;
-            const sat_geom_t *g = &g_geom_cache[i0];
+            const sat_geom_t *g;
             obsd_t vd;
             int any = 0;
             int sb;
             double freq, lam;
 
+            if (vis->items[vi].source != SRC_COMMON) continue;
+            i0 = vis->items[vi].idx_a;
+            i1 = vis->items[vi].idx_b;
+            d0 = &s0->data[i0];
+            g = &g_geom_cache[i0];
             if (!g->valid) continue;
-            i1 = find_sat_in_snap(s1, d0->sat);
-            if (i1 < 0) continue;
             d1 = &s1->data[i1];
             sat = d0->sat;
             sys = satsys(sat, &prn); (void)prn;
             sb = sys_bit_index(sys);
-            if (sb < 0) continue;
+            if (sb < 0 || !clk_valid[sb]) continue;
 
             memset(&vd, 0, sizeof(vd));
             vd.time = d0->time;
@@ -1316,17 +1638,28 @@ static int build_virt_obs_with_eph(
 
                 /* ----- Pseudorange path (unchanged from previous version) ----- */
                 if (d0->P[j] > 0.0 && d1->P[j1] > 0.0) {
+                    int ci = (int)d0->code[j] - 1;
                     eps_A = d0->P[j]   - g->rho_A + CLIGHT * g->dts0
-                          - g->ion_A - g->trp_A - clk_A;
+                          - g->ion_A - g->trp_A - clk_A_sys[sb];
                     eps_B = d1->P[j1]  - g->rho_B + CLIGHT * g->dts0
-                          - g->ion_B - g->trp_B - clk_B;
+                          - g->ion_B - g->trp_B - clk_B_sys[sb];
                     if (fabs(eps_A - eps_B) > 30.0) {
                         /* Multipath/slip on this signal: skip whole signal. */
+                        if (diag_out && ci >= 0 && ci < MAXCODE)
+                            diag_out->residual_reject_n[sb][ci]++;
                         continue;
+                    }
+                    if (ci >= 0 && ci < MAXCODE &&
+                        code_eps_n[sb][ci] < MAXOBS) {
+                        int n = code_eps_n[sb][ci]++;
+                        code_eps_A[sb][ci][n] = eps_A;
+                        code_eps_B[sb][ci][n] = eps_B;
+                        code_halfdiff[sb][ci][n] = 0.5 * (eps_A - eps_B);
                     }
                     sum_dd2 += (eps_A - eps_B) * (eps_A - eps_B);
                     n_dd++;
-                    Pv = g->rho_V - CLIGHT * g->dts0 + g->ion_V + g->trp_V + clk_V
+                    Pv = g->rho_V - CLIGHT * g->dts0 + g->ion_V + g->trp_V
+                       + 0.5 * (clk_A_sys[sb] + clk_B_sys[sb])
                        + 0.5 * (eps_A + eps_B);
                     vd.code[j] = d0->code[j];
                     vd.P[j] = Pv;
@@ -1461,16 +1794,592 @@ static int build_virt_obs_with_eph(
     *pnv = nv;
     if (clk_A_out)    *clk_A_out    = clk_A;
     if (clk_B_out)    *clk_B_out    = clk_B;
-    if (nclk_A_out)   *nclk_A_out   = n_res_A;
-    if (nclk_B_out)   *nclk_B_out   = n_res_B;
+    if (nclk_A_out)   *nclk_A_out   = n_res_A_total;
+    if (nclk_B_out)   *nclk_B_out   = n_res_B_total;
     if (rms_eps_out)  *rms_eps_out  = (n_dd > 0) ? sqrt(sum_dd2 / n_dd) * 0.5 : 0.0;
-    return 1;
+    if (cal_out) {
+        for (j = 0; j < 7; j++) {
+            cal_out->clock_valid[j] = clk_valid[j];
+            cal_out->clk_a_sys[j] = clk_A_sys[j];
+            cal_out->clk_b_sys[j] = clk_B_sys[j];
+            cal_out->n_a[j] = n_res_A[j];
+            cal_out->n_b[j] = n_res_B[j];
+        }
+    }
+    if (diag_out) {
+        int sb, ci;
+        double debiased_sum2 = 0.0;
+        for (sb = 0; sb < 7; sb++) {
+            for (ci = 0; ci < MAXCODE; ci++) {
+                int n = code_eps_n[sb][ci];
+                double sum2 = 0.0;
+                int k;
+                diag_out->residual_n[sb][ci] = n;
+                if (n <= 0) continue;
+                memcpy(tmp, code_eps_A[sb][ci], (size_t)n * sizeof(double));
+                diag_out->residual_med_a_m[sb][ci] = median_of(tmp, n);
+                memcpy(tmp, code_eps_B[sb][ci], (size_t)n * sizeof(double));
+                diag_out->residual_med_b_m[sb][ci] = median_of(tmp, n);
+                memcpy(tmp, code_halfdiff[sb][ci], (size_t)n * sizeof(double));
+                diag_out->residual_med_halfdiff_m[sb][ci] = median_of(tmp, n);
+                for (k = 0; k < n; k++)
+                    sum2 += code_halfdiff[sb][ci][k] * code_halfdiff[sb][ci][k];
+                diag_out->residual_rms_halfdiff_m[sb][ci] = sqrt(sum2 / n);
+                if (n >= VRS_MIN_CODE_BIAS_SATS) {
+                    for (k = 0; k < n; k++) {
+                        double d = code_halfdiff[sb][ci][k] -
+                                   diag_out->residual_med_halfdiff_m[sb][ci];
+                        debiased_sum2 += d * d;
+                        diag_out->residual_debiased_n++;
+                    }
+                }
+            }
+        }
+        if (diag_out->residual_debiased_n > 0)
+            diag_out->residual_rms_debiased_halfdiff_m =
+                sqrt(debiased_sum2 / diag_out->residual_debiased_n);
+    }
+    return nv > 0;
+}
+
+static void print_code_resid_diag(const code_resid_diag_t *diag)
+{
+    int sb, ci;
+    int any_clock = 0, any_resid = 0;
+
+    if (!diag) return;
+
+    for (sb = 0; sb < 7; sb++) {
+        for (ci = 0; ci < MAXCODE; ci++) {
+            if (diag->clock_code_a_n[sb][ci] > 0 ||
+                diag->clock_code_b_n[sb][ci] > 0)
+                any_clock = 1;
+            if (diag->residual_n[sb][ci] > 0 ||
+                diag->residual_reject_n[sb][ci] > 0)
+                any_resid = 1;
+        }
+    }
+    if (!any_clock && !any_resid) return;
+
+    if (any_clock) {
+        int printed_any = 0;
+        printf("  clk-fit codes:");
+        for (sb = 0; sb < 7; sb++) {
+            for (ci = 0; ci < MAXCODE; ci++) {
+                int na = diag->clock_code_a_n[sb][ci];
+                int nb = diag->clock_code_b_n[sb][ci];
+                if (na <= 0 && nb <= 0) continue;
+                printf("%s%s/%s:A%d,B%d",
+                       printed_any ? " " : " ",
+                       sys_bit_name(sb), code2obs((uint8_t)(ci + 1)), na, nb);
+                printed_any = 1;
+            }
+        }
+        printf("\n");
+    }
+    if (any_resid) {
+        printf("  code-resid:");
+        for (sb = 0; sb < 7; sb++) {
+            for (ci = 0; ci < MAXCODE; ci++) {
+                int n = diag->residual_n[sb][ci];
+                int nr = diag->residual_reject_n[sb][ci];
+                if (n <= 0 && nr <= 0) continue;
+                printf(" %s/%s:n=%d Amed=%+.3f Bmed=%+.3f halfmed=%+.3f halfrms=%.3f rej=%d;",
+                       sys_bit_name(sb), code2obs((uint8_t)(ci + 1)), n,
+                       diag->residual_med_a_m[sb][ci],
+                       diag->residual_med_b_m[sb][ci],
+                       diag->residual_med_halfdiff_m[sb][ci],
+                       diag->residual_rms_halfdiff_m[sb][ci], nr);
+            }
+        }
+        printf("\n");
+    }
+}
+
+static void print_code_bias_diag(const cross_source_bias_state_t *bias)
+{
+    int sb, ci, any = 0;
+
+    if (!bias) return;
+    for (sb = 0; sb < 7; sb++) {
+        for (ci = 0; ci < MAXCODE; ci++) {
+            if (bias->code_n[sb][ci] > 0) {
+                any = 1;
+                break;
+            }
+        }
+        if (any) break;
+    }
+    if (!any) return;
+
+    printf("  code-bias:");
+    for (sb = 0; sb < 7; sb++) {
+        for (ci = 0; ci < MAXCODE; ci++) {
+            if (bias->code_n[sb][ci] <= 0) continue;
+            printf(" %s/%s:n=%d ab=%+.3f sigma=%.3f valid=%d;",
+                   sys_bit_name(sb), code2obs((uint8_t)(ci + 1)),
+                   bias->code_n[sb][ci], bias->code_bias_ab_m[sb][ci],
+                   bias->code_sigma_m[sb][ci], bias->code_valid[sb][ci]);
+        }
+    }
+    printf("\n");
+}
+
+static int transfer_single_source_candidates(
+    const epoch_pair_t *pair, const visibility_set_t *vis,
+    sat_source_t source, const double r_src[3], const double r_v[3],
+    virt_obs_t *out, int max_out)
+{
+    static single_geom_t geom[MAXOBS];
+    const epoch_snap_t *src = source == SRC_A_ONLY ? pair->a : pair->b;
+    int vi, j, n = 0;
+
+    if (source != SRC_A_ONLY && source != SRC_B_ONLY) return 0;
+    if (!prepare_single_source_geometry(src, r_src, r_v, geom)) return 0;
+
+    for (vi = 0; vi < vis->n && n < max_out; vi++) {
+        int idx, sys, prn;
+        const obsd_t *d;
+        const single_geom_t *g;
+        virt_obs_t *v;
+        int any = 0;
+
+        if (vis->items[vi].source != source) continue;
+        idx = source == SRC_A_ONLY ? vis->items[vi].idx_a : vis->items[vi].idx_b;
+        if (idx < 0) continue;
+        d = &src->data[idx];
+        g = &geom[idx];
+        if (!g->valid) continue;
+        sys = satsys(d->sat, &prn); (void)prn;
+
+        v = &out[n];
+        memset(v, 0, sizeof(*v));
+        v->source = source;
+        v->obs.time = d->time;
+        v->obs.sat = d->sat;
+        v->obs.freq = d->freq;
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            double metric_shift, freq, lam;
+            if (d->code[j] == CODE_NONE) continue;
+            if (d->P[j] == 0.0 && d->L[j] == 0.0) continue;
+            metric_shift = (g->rho_v - g->rho_src)
+                         + (g->ion_v - g->ion_src)
+                         + (g->trp_v - g->trp_src);
+            v->obs.code[j] = d->code[j];
+            if (d->P[j] > 0.0)
+                v->obs.P[j] = d->P[j] + metric_shift;
+            if (d->L[j] != 0.0) {
+                freq = code2freq(sys, d->code[j], d->freq);
+                lam = freq > 0.0 ? CLIGHT / freq : 0.0;
+                if (lam > 0.0)
+                    v->obs.L[j] = d->L[j] + metric_shift / lam;
+            }
+            v->obs.SNR[j] = d->SNR[j];
+            v->obs.LLI[j] = d->LLI[j];
+            any = 1;
+        }
+        if (any) n++;
+    }
+    return n;
+}
+
+static void assemble_shadow_union_candidates(
+    const obsd_t *common, int n_common,
+    const virt_obs_t *a_only, int n_a_only,
+    const virt_obs_t *b_only, int n_b_only,
+    virt_epoch_t *out)
+{
+    int i;
+
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < n_common && out->n < (int)(MAXOBS * 2); i++) {
+        out->data[out->n].obs = common[i];
+        out->data[out->n].source = SRC_COMMON;
+        out->n++;
+        out->n_common++;
+    }
+    for (i = 0; i < n_a_only && out->n < (int)(MAXOBS * 2); i++) {
+        out->data[out->n++] = a_only[i];
+        out->n_a_only++;
+    }
+    for (i = 0; i < n_b_only && out->n < (int)(MAXOBS * 2); i++) {
+        out->data[out->n++] = b_only[i];
+        out->n_b_only++;
+    }
+}
+
+static baseline_state_t make_baseline_state(double length_m)
+{
+    baseline_state_t s;
+
+    memset(&s, 0, sizeof(s));
+    s.length_m = length_m;
+    s.valid = length_m > 0.0 && length_m <= VRS_MAX_BASELINE_M;
+    /* Stage 3 uses surveyed 1005/1006 ARPs as the fixed baseline source. */
+    s.fixed = s.valid;
+    return s;
+}
+
+static void estimate_cross_source_bias(
+    const epoch_pair_t *pair, const visibility_set_t *vis,
+    cross_source_bias_state_t *out)
+{
+    static double code_samples[7][MAXCODE][MAXOBS];
+    static int code_count[7][MAXCODE];
+    static double phase_samples[7][MAXCODE][MAXOBS];
+    static int phase_count[7][MAXCODE];
+    static double tmp[MAXOBS];
+    const epoch_snap_t *s0 = pair->a;
+    const epoch_snap_t *s1 = pair->b;
+    int vi, j, sb, ci;
+
+    memset(out, 0, sizeof(*out));
+    memset(code_count, 0, sizeof(code_count));
+    memset(phase_count, 0, sizeof(phase_count));
+
+    for (vi = 0; vi < vis->n; vi++) {
+        const sat_visibility_t *v = &vis->items[vi];
+        const obsd_t *d0, *d1;
+        const sat_geom_t *g;
+        int sys, prn;
+
+        if (v->source != SRC_COMMON) continue;
+        if (v->idx_a < 0 || v->idx_b < 0) continue;
+        d0 = &s0->data[v->idx_a];
+        d1 = &s1->data[v->idx_b];
+        g = &g_geom_cache[v->idx_a];
+        if (!g->valid || d0->sat <= 0 || d0->sat > MAXSAT) continue;
+        sys = satsys(d0->sat, &prn); (void)prn;
+        sb = sys_bit_index(sys);
+        if (sb < 0) continue;
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            amb_cache_t *a;
+            double freq, lam, l_a_at_v, l_b_aligned_at_v;
+            int j1, ref_sat;
+
+            if (d0->code[j] == CODE_NONE) continue;
+            j1 = find_same_code_idx(d1, d0->code[j]);
+            if (j1 < 0) continue;
+            ci = (int)d0->code[j] - 1;
+            if (ci < 0 || ci >= MAXCODE) continue;
+
+            if (d0->P[j] > 0.0 && d1->P[j1] > 0.0 &&
+                code_count[sb][ci] < MAXOBS) {
+                double raw_a = d0->P[j] - g->rho_A + CLIGHT * g->dts0
+                             - g->ion_A - g->trp_A;
+                double raw_b = d1->P[j1] - g->rho_B + CLIGHT * g->dts0
+                             - g->ion_B - g->trp_B;
+                code_samples[sb][ci][code_count[sb][ci]++] = raw_b - raw_a;
+            }
+
+            if (d0->L[j] == 0.0 || d1->L[j1] == 0.0) continue;
+            ref_sat = g_ref_sat[sb][ci];
+            a = &g_amb[d0->sat - 1][ci];
+            if (!a->valid || ref_sat <= 0 || a->ref_sat != ref_sat) continue;
+            if (phase_count[sb][ci] >= MAXOBS) continue;
+
+            freq = code2freq(sys, d0->code[j], d0->freq);
+            lam = freq > 0.0 ? CLIGHT / freq : 0.0;
+            if (lam <= 0.0) continue;
+
+            l_a_at_v = d0->L[j] + (g->rho_V - g->rho_A) / lam;
+            l_b_aligned_at_v = d1->L[j1] + a->dd_n
+                              + (g->rho_V - g->rho_B) / lam;
+            phase_samples[sb][ci][phase_count[sb][ci]++] =
+                l_b_aligned_at_v - l_a_at_v;
+        }
+    }
+
+    for (sb = 0; sb < 7; sb++) {
+        for (ci = 0; ci < MAXCODE; ci++) {
+            double med, sum2 = 0.0, sigma;
+            int n = code_count[sb][ci];
+            out->code_n[sb][ci] = n;
+            if (n >= VRS_MIN_CODE_BIAS_SATS) {
+                memcpy(tmp, code_samples[sb][ci], (size_t)n * sizeof(double));
+                med = median_of(tmp, n);
+                sum2 = 0.0;
+                for (j = 0; j < n; j++) {
+                    double d = code_samples[sb][ci][j] - med;
+                    sum2 += d * d;
+                }
+                sigma = sqrt(sum2 / n);
+                out->code_bias_ab_m[sb][ci] = med;
+                out->code_sigma_m[sb][ci] = sigma;
+                if (sigma <= VRS_MAX_CODE_BIAS_SIGMA_M)
+                    out->code_valid[sb][ci] = 1;
+            }
+        }
+    }
+
+    for (sb = 0; sb < 7; sb++) {
+        for (ci = 0; ci < MAXCODE; ci++) {
+            double med, sum2 = 0.0, sigma;
+            int n = phase_count[sb][ci];
+
+            out->phase_n[sb][ci] = n;
+            if (n < VRS_MIN_PHASE_BIAS_SATS) continue;
+            memcpy(tmp, phase_samples[sb][ci], (size_t)n * sizeof(double));
+            med = median_of(tmp, n);
+            for (j = 0; j < n; j++) {
+                double d = phase_samples[sb][ci][j] - med;
+                sum2 += d * d;
+            }
+            sigma = sqrt(sum2 / n);
+            out->phase_bias_ab_cyc[sb][ci] = med;
+            out->phase_sigma_cyc[sb][ci] = sigma;
+            if (sigma <= VRS_MAX_PHASE_BIAS_SIGMA_CYC)
+                out->phase_valid[sb][ci] = 1;
+        }
+    }
+}
+
+static int adjust_single_source_for_union(
+    const virt_obs_t *src, int n_src,
+    const cross_source_bias_state_t *bias,
+    virt_obs_t *out, int max_out)
+{
+    int i, j, n = 0;
+
+    for (i = 0; i < n_src && n < max_out; i++) {
+        const virt_obs_t *in = &src[i];
+        virt_obs_t *v = &out[n];
+        int sys, prn, sb, any = 0;
+        double sign;
+
+        if (in->source != SRC_A_ONLY && in->source != SRC_B_ONLY) continue;
+        sys = satsys(in->obs.sat, &prn); (void)prn;
+        sb = sys_bit_index(sys);
+        if (sb < 0) continue;
+        sign = in->source == SRC_A_ONLY ? 1.0 : -1.0;
+
+        memset(v, 0, sizeof(*v));
+        v->source = in->source;
+        v->obs.time = in->obs.time;
+        v->obs.sat = in->obs.sat;
+        v->obs.freq = in->obs.freq;
+
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            int ci;
+            if (in->obs.code[j] == CODE_NONE) continue;
+            ci = (int)in->obs.code[j] - 1;
+            if (ci < 0 || ci >= MAXCODE) continue;
+
+            if (in->obs.P[j] > 0.0 && bias->code_valid[sb][ci]) {
+                v->obs.P[j] = in->obs.P[j]
+                            + sign * 0.5 * bias->code_bias_ab_m[sb][ci];
+            }
+            if (in->obs.L[j] != 0.0 &&
+                in->source == SRC_A_ONLY &&
+                bias->phase_valid[sb][ci]) {
+                /* A is the phase anchor in stage 3. B-only phase still lacks a
+                 * per-satellite DD bridge, so it stays out of the union output. */
+                v->obs.L[j] = in->obs.L[j]
+                            + 0.5 * bias->phase_bias_ab_cyc[sb][ci];
+            }
+            if (v->obs.P[j] == 0.0 && v->obs.L[j] == 0.0) continue;
+            v->obs.code[j] = in->obs.code[j];
+            v->obs.SNR[j] = in->obs.SNR[j];
+            v->obs.LLI[j] = in->obs.LLI[j];
+            any = 1;
+        }
+        if (any) n++;
+    }
+    return n;
+}
+
+static int assemble_publish_union_candidates(
+    const obsd_t *common, int n_common,
+    const virt_obs_t *a_only, int n_a_only,
+    const virt_obs_t *b_only, int n_b_only,
+    obsd_t *out, int *n_extra_out)
+{
+    int i, n = 0, n_extra = 0;
+
+    for (i = 0; i < n_common && n < MAXOBS; i++)
+        out[n++] = common[i];
+    for (i = 0; i < n_a_only && n < MAXOBS; i++) {
+        out[n++] = a_only[i].obs;
+        n_extra++;
+    }
+    for (i = 0; i < n_b_only && n < MAXOBS; i++) {
+        out[n++] = b_only[i].obs;
+        n_extra++;
+    }
+    if (n_extra_out) *n_extra_out = n_extra;
+    return n;
+}
+
+static publish_plan_t decide_publish_plan(
+    int used_eph, const baseline_state_t *baseline,
+    const visibility_set_t *vis, double rms_eps, int n_publish_extra)
+{
+    publish_plan_t p;
+
+    memset(&p, 0, sizeof(p));
+    p.mode = used_eph ? VRS_MODE_COMMON_ONLY : VRS_MODE_FALLBACK;
+    p.reason = used_eph ? UNION_REASON_NO_EXTRA : UNION_REASON_NO_EPH;
+    p.n_publish_extra = n_publish_extra;
+    if (!used_eph) return p;
+    if (!baseline->valid || !baseline->fixed) {
+        p.reason = UNION_REASON_BASELINE;
+        return p;
+    }
+    if (vis->n_common < VRS_MIN_COMMON_FOR_UNION) {
+        p.reason = UNION_REASON_COMMON;
+        return p;
+    }
+    if (rms_eps > VRS_MAX_UNION_RMS_M) {
+        p.reason = UNION_REASON_RESIDUAL;
+        return p;
+    }
+    if (n_publish_extra <= 0) return p;
+    p.mode = VRS_MODE_UNION;
+    p.reason = UNION_REASON_OK;
+    return p;
+}
+
+static const char *vrs_mode_name(vrs_mode_t mode)
+{
+    switch (mode) {
+    case VRS_MODE_MUTE: return "mute";
+    case VRS_MODE_FALLBACK: return "fallback";
+    case VRS_MODE_COMMON_ONLY: return "common-only";
+    case VRS_MODE_UNION: return "union";
+    default: return "unknown";
+    }
+}
+
+static const char *union_reason_name(union_reason_t reason)
+{
+    switch (reason) {
+    case UNION_REASON_OK: return "ok";
+    case UNION_REASON_NO_EPH: return "no-eph";
+    case UNION_REASON_BASELINE: return "baseline";
+    case UNION_REASON_COMMON: return "common";
+    case UNION_REASON_RESIDUAL: return "residual";
+    case UNION_REASON_NO_EXTRA: return "no-extra";
+    default: return "unknown";
+    }
+}
+
+static const char *target_mode_name(vrs_target_mode_t mode)
+{
+    switch (mode) {
+    case VRS_TARGET_BASE_A: return "base-a";
+    case VRS_TARGET_MIDPOINT:
+    default: return "midpoint";
+    }
+}
+
+static void set_virtual_target(double out[3])
+{
+    if (g_target_mode == VRS_TARGET_BASE_A) {
+        out[0] = g_arp_ecef[0][0];
+        out[1] = g_arp_ecef[0][1];
+        out[2] = g_arp_ecef[0][2];
+        return;
+    }
+    out[0] = 0.5 * (g_arp_ecef[0][0] + g_arp_ecef[1][0]);
+    out[1] = 0.5 * (g_arp_ecef[0][1] + g_arp_ecef[1][1]);
+    out[2] = 0.5 * (g_arp_ecef[0][2] + g_arp_ecef[1][2]);
+}
+
+static void compute_backsolve_qc(
+    const epoch_pair_t *pair, const obsd_t *common, int n_common,
+    const virt_obs_t *a_only, int n_a_only,
+    const common_cal_t *cal, const cross_source_bias_state_t *bias,
+    backsolve_qc_t *out)
+{
+    const epoch_snap_t *s0 = pair->a;
+    double sum_common_p2 = 0.0, sum_common_l2 = 0.0;
+    double sum_self_p2 = 0.0, sum_self_l2 = 0.0;
+    int i, j;
+
+    memset(out, 0, sizeof(*out));
+    if (g_target_mode != VRS_TARGET_BASE_A) return;
+    out->enabled = 1;
+
+    for (i = 0; i < n_common; i++) {
+        int ia = find_sat_in_snap(s0, common[i].sat);
+        int sys, prn, sb;
+        const obsd_t *a;
+        if (ia < 0) continue;
+        a = &s0->data[ia];
+        sys = satsys(common[i].sat, &prn); (void)prn;
+        sb = sys_bit_index(sys);
+        if (sb < 0) continue;
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            int ja, ci;
+            double d;
+            if (common[i].code[j] == CODE_NONE) continue;
+            ja = find_same_code_idx(a, common[i].code[j]);
+            if (ja < 0) continue;
+            ci = (int)common[i].code[j] - 1;
+            if (common[i].P[j] > 0.0 && a->P[ja] > 0.0 &&
+                cal->clock_valid[sb]) {
+                double code_bias = (ci >= 0 && ci < MAXCODE &&
+                                    bias->code_valid[sb][ci])
+                                 ? bias->code_bias_ab_m[sb][ci]
+                                 : cal->clk_b_sys[sb] - cal->clk_a_sys[sb];
+                d = common[i].P[j] -
+                    (a->P[ja] + 0.5 * code_bias);
+                sum_common_p2 += d * d;
+                out->n_common_p++;
+            }
+            if (ci >= 0 && ci < MAXCODE &&
+                common[i].L[j] != 0.0 && a->L[ja] != 0.0 &&
+                bias->phase_valid[sb][ci]) {
+                d = common[i].L[j] -
+                    (a->L[ja] + 0.5 * bias->phase_bias_ab_cyc[sb][ci]);
+                sum_common_l2 += d * d;
+                out->n_common_l++;
+            }
+        }
+    }
+
+    for (i = 0; i < n_a_only; i++) {
+        int ia = find_sat_in_snap(s0, a_only[i].obs.sat);
+        const obsd_t *a;
+        if (ia < 0) continue;
+        a = &s0->data[ia];
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            int ja;
+            double d;
+            if (a_only[i].obs.code[j] == CODE_NONE) continue;
+            ja = find_same_code_idx(a, a_only[i].obs.code[j]);
+            if (ja < 0) continue;
+            if (a_only[i].obs.P[j] > 0.0 && a->P[ja] > 0.0) {
+                d = a_only[i].obs.P[j] - a->P[ja];
+                sum_self_p2 += d * d;
+                out->n_self_p++;
+            }
+            if (a_only[i].obs.L[j] != 0.0 && a->L[ja] != 0.0) {
+                d = a_only[i].obs.L[j] - a->L[ja];
+                sum_self_l2 += d * d;
+                out->n_self_l++;
+            }
+        }
+    }
+
+    out->rms_common_p_m =
+        out->n_common_p > 0 ? sqrt(sum_common_p2 / out->n_common_p) : 0.0;
+    out->rms_common_l_cyc =
+        out->n_common_l > 0 ? sqrt(sum_common_l2 / out->n_common_l) : 0.0;
+    out->rms_self_p_m =
+        out->n_self_p > 0 ? sqrt(sum_self_p2 / out->n_self_p) : 0.0;
+    out->rms_self_l_cyc =
+        out->n_self_l > 0 ? sqrt(sum_self_l2 / out->n_self_l) : 0.0;
 }
 
 /* Two bases: ephemeris path (clock-corrected average) preferred, Apollonius fallback. */
 static void try_synth_virtual_obs(void)
 {
     const epoch_snap_t *s0 = &g_epoch_snap[0], *s1 = &g_epoch_snap[1];
+    epoch_pair_t pair;
+    visibility_set_t vis;
     double b, mid[3];
     int nv = 0, k, msm_count, send_station = 0;
     msm_chunk_t msm_chunks[MSM_MAX_CHUNKS];
@@ -1478,51 +2387,109 @@ static void try_synth_virtual_obs(void)
     int tx_agg_len = 0;
     int dec_obs = 0, dec_sta = 0, dec_err = 0;
     obsd_t virt[MAXOBS];
+    obsd_t union_publish[MAXOBS];
+    obsd_t publish_obs[MAXOBS];
+    virt_obs_t shadow_a_only[MAXOBS];
+    virt_obs_t shadow_b_only[MAXOBS];
+    virt_obs_t union_a_only[MAXOBS];
+    virt_obs_t union_b_only[MAXOBS];
+    virt_epoch_t shadow_union;
+    common_cal_t common_cal;
+    code_resid_diag_t code_diag;
+    cross_source_bias_state_t bias_state;
+    baseline_state_t baseline;
+    publish_plan_t plan;
+    backsolve_qc_t backsolve_qc;
     int used_eph = 0;
-    double clk_A = 0.0, clk_B = 0.0, rms_eps = 0.0;
+    int n_shadow_a = 0, n_shadow_b = 0;
+    int n_union_a = 0, n_union_b = 0;
+    int n_union_publish = 0, n_publish_extra = 0;
+    int n_publish = 0;
+    double clk_A = 0.0, clk_B = 0.0, rms_eps = 0.0, rms_eps_debiased = 0.0;
     int nclk_A = 0, nclk_B = 0;
     int ssr_n = 0;
 
     if (g_base_n != 2) return;
     if (!g_enc_inited) return;
-    if (s0->n <= 0 || s1->n <= 0) return;
-    if (fabs(timediff(s0->time, s1->time)) > 0.5) return;
+    if (!make_epoch_pair(s0, s1, &pair)) return;
     if (!g_arp_valid[0] || !g_arp_valid[1]) return;
+    classify_visibility(&pair, &vis);
 
     b = norm3diff(g_arp_ecef[1], g_arp_ecef[0]);
     if (b <= 0.0) return;
+    baseline = make_baseline_state(b);
 
     print_enter();
 
-    if (g_have_synth_epoch && fabs(timediff(s0->time, g_last_synth_epoch)) < 0.95) {
+    if (g_have_synth_epoch && fabs(timediff(pair.time, g_last_synth_epoch)) < 0.95) {
         print_leave();
         return;
     }
-    g_last_synth_epoch = s0->time;
+    g_last_synth_epoch = pair.time;
     g_have_synth_epoch = 1;
 
-    mid[0] = 0.5 * (g_arp_ecef[0][0] + g_arp_ecef[1][0]);
-    mid[1] = 0.5 * (g_arp_ecef[0][1] + g_arp_ecef[1][1]);
-    mid[2] = 0.5 * (g_arp_ecef[0][2] + g_arp_ecef[1][2]);
+    set_virtual_target(mid);
 
     /* Reset per-epoch carrier-side QC counters (build_virt_obs_with_eph fills them). */
     g_qc_n_fix = g_qc_n_float = g_qc_n_drop = g_qc_ref_switch = 0;
+    memset(&common_cal, 0, sizeof(common_cal));
+    memset(&code_diag, 0, sizeof(code_diag));
+    memset(&bias_state, 0, sizeof(bias_state));
+    memset(&backsolve_qc, 0, sizeof(backsolve_qc));
 
     /* Prefer ephemeris-aware path (clean clock removal + true geometry). */
     if (g_nav_inited && g_nav_n_total() >= 4) {
-        if (build_virt_obs_with_eph(s0, s1, g_arp_ecef[0], g_arp_ecef[1], mid,
+        if (build_virt_obs_with_eph(&pair, &vis, g_arp_ecef[0], g_arp_ecef[1], mid,
                                     virt, &nv, &clk_A, &clk_B,
-                                    &nclk_A, &nclk_B, &rms_eps)) {
+                                    &nclk_A, &nclk_B, &rms_eps, &common_cal,
+                                    &code_diag)) {
             used_eph = 1;
         }
     }
     if (!used_eph) {
-        build_virt_obs_apollonius(s0, s1, b, virt, &nv);
+        build_virt_obs_apollonius(&pair, &vis, b, virt, &nv);
+    }
+    if (used_eph) {
+        n_shadow_a = transfer_single_source_candidates(
+            &pair, &vis, SRC_A_ONLY, g_arp_ecef[0], mid,
+            shadow_a_only, MAXOBS);
+        n_shadow_b = transfer_single_source_candidates(
+            &pair, &vis, SRC_B_ONLY, g_arp_ecef[1], mid,
+            shadow_b_only, MAXOBS);
+        assemble_shadow_union_candidates(
+            virt, nv, shadow_a_only, n_shadow_a, shadow_b_only, n_shadow_b,
+            &shadow_union);
+        estimate_cross_source_bias(&pair, &vis, &bias_state);
+        n_union_a = adjust_single_source_for_union(
+            shadow_a_only, n_shadow_a, &bias_state, union_a_only, MAXOBS);
+        n_union_b = adjust_single_source_for_union(
+            shadow_b_only, n_shadow_b, &bias_state, union_b_only, MAXOBS);
+        n_union_publish = assemble_publish_union_candidates(
+            virt, nv, union_a_only, n_union_a, union_b_only, n_union_b,
+            union_publish, &n_publish_extra);
+        compute_backsolve_qc(&pair, virt, nv, shadow_a_only, n_shadow_a,
+                             &common_cal, &bias_state, &backsolve_qc);
+        rms_eps_debiased = code_diag.residual_debiased_n > 0
+                         ? code_diag.residual_rms_debiased_halfdiff_m
+                         : rms_eps;
+    }
+    else {
+        memset(&shadow_union, 0, sizeof(shadow_union));
     }
 
-    prepare_virt_for_msm7(virt, &nv);
+    plan = decide_publish_plan(used_eph, &baseline, &vis, rms_eps_debiased,
+                               n_publish_extra);
+    if (plan.mode == VRS_MODE_UNION) {
+        n_publish = n_union_publish;
+        memcpy(publish_obs, union_publish, (size_t)n_publish * sizeof(obsd_t));
+    }
+    else {
+        n_publish = nv;
+        memcpy(publish_obs, virt, (size_t)n_publish * sizeof(obsd_t));
+    }
+    prepare_virt_for_msm7(publish_obs, &n_publish);
 
-    if (nv <= 0) {
+    if (n_publish <= 0) {
         printf("VRS [%s]: no valid sats this epoch (eph_n=%d)\n",
                used_eph ? "eph" : "apollonius", g_nav_n_total());
         fflush(stdout);
@@ -1531,15 +2498,15 @@ static void try_synth_virtual_obs(void)
     }
 
     memset(g_enc_rtcm.cp, 0, sizeof(g_enc_rtcm.cp));
-    g_enc_rtcm.time = s0->time;
+    g_enc_rtcm.time = pair.time;
     g_enc_rtcm.staid = OUT_VIRT_STAID;
     g_enc_rtcm.seqno = (g_enc_rtcm.seqno + 1) & 7;
     g_enc_rtcm.sta.pos[0] = mid[0];
     g_enc_rtcm.sta.pos[1] = mid[1];
     g_enc_rtcm.sta.pos[2] = mid[2];
 
-    g_enc_rtcm.obs.n = nv;
-    memcpy(g_enc_rtcm.obs.data, virt, (size_t)nv * sizeof(obsd_t));
+    g_enc_rtcm.obs.n = n_publish;
+    memcpy(g_enc_rtcm.obs.data, publish_obs, (size_t)n_publish * sizeof(obsd_t));
 
     msm_count = build_msm_chunks(&g_enc_rtcm.obs, msm_chunks, MSM_MAX_CHUNKS);
 
@@ -1547,7 +2514,7 @@ static void try_synth_virtual_obs(void)
         send_station = 1;
     }
     else {
-        double dt = timediff(s0->time, g_last_station_tx_epoch);
+        double dt = timediff(pair.time, g_last_station_tx_epoch);
         if (dt >= VIRT_STATION_INTERVAL - 0.5 || dt < -0.5)
             send_station = 1;
     }
@@ -1558,7 +2525,7 @@ static void try_synth_virtual_obs(void)
             tx_agg_len += g_enc_rtcm.nbyte;
         }
         tx_send_buf(g_enc_rtcm.buff, g_enc_rtcm.nbyte);
-        g_last_station_tx_epoch = s0->time;
+        g_last_station_tx_epoch = pair.time;
         g_have_station_tx_epoch = 1;
     }
 
@@ -1595,20 +2562,42 @@ static void try_synth_virtual_obs(void)
     ssr_n = g_nav_ssr_orbclk_total();
 
     if (used_eph) {
-        printf("VRS [%s] :%u TX=%dB nv=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
+        printf("VRS [%s] :%u TX=%dB nv=%d | target=%s | mode=%s reason=%s extra=%d | baseline=%.3fm fixed=%d | vis A=%d B=%d common=%d | shadow A=%d B=%d union=%d | publish A=%d B=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
                "d_clk=%+.3fm | rms((eps_A-eps_B)/2)=%.3fm | L: fix=%d float=%d drop=%d "
-               "refSwap=%d | brdc=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
+               "refSwap=%d",
                ssr_n >= 4 ? "ssr-com" : "brdc",
-               (unsigned)RTCM_OUT_PORT, tx_agg_len, nv,
+               (unsigned)RTCM_OUT_PORT, tx_agg_len, n_publish,
+               target_mode_name(g_target_mode),
+               vrs_mode_name(plan.mode), union_reason_name(plan.reason), plan.n_publish_extra,
+               baseline.length_m, baseline.fixed,
+               vis.n_a_only, vis.n_b_only, vis.n_common,
+               shadow_union.n_a_only, shadow_union.n_b_only, shadow_union.n,
+               n_union_a, n_union_b,
                clk_A, nclk_A, clk_B, nclk_B, clk_A - clk_B,
                rms_eps,
-               g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch,
-               g_nav_n_total(), ssr_n, g_ssr_nmsg,
-               dec_obs, dec_sta, dec_err);
+               g_qc_n_fix, g_qc_n_float, g_qc_n_drop, g_qc_ref_switch);
+        printf(" codeDetrend=%.3fm", rms_eps_debiased);
+        if (backsolve_qc.enabled) {
+            printf(" | backsolve P=%.3fm/%d L=%.4fcyc/%d selfP=%.6fm/%d selfL=%.6fcyc/%d",
+                   backsolve_qc.rms_common_p_m, backsolve_qc.n_common_p,
+                   backsolve_qc.rms_common_l_cyc, backsolve_qc.n_common_l,
+                   backsolve_qc.rms_self_p_m, backsolve_qc.n_self_p,
+                   backsolve_qc.rms_self_l_cyc, backsolve_qc.n_self_l);
+        }
+        printf(" | brdc=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
+               g_nav_n_total(), ssr_n, g_ssr_nmsg, dec_obs, dec_sta, dec_err);
+        if (backsolve_qc.enabled)
+            print_code_resid_diag(&code_diag);
+        if (backsolve_qc.enabled)
+            print_code_bias_diag(&bias_state);
     }
     else {
-        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d eph_n=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
-               (unsigned)RTCM_OUT_PORT, tx_agg_len, nv, g_nav_n_total(),
+        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d | target=%s | mode=%s reason=%s | baseline=%.3fm fixed=%d | vis A=%d B=%d common=%d | eph_n=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
+               (unsigned)RTCM_OUT_PORT, tx_agg_len, n_publish,
+               target_mode_name(g_target_mode),
+               vrs_mode_name(plan.mode), union_reason_name(plan.reason),
+               baseline.length_m, baseline.fixed,
+               vis.n_a_only, vis.n_b_only, vis.n_common, g_nav_n_total(),
                ssr_n, g_ssr_nmsg,
                dec_obs, dec_sta, dec_err);
     }
@@ -1786,13 +2775,21 @@ static void *stream_thread_proc(void *param)
 }
 #endif
 
-/* Parse: argv[1] must be -c or -e, then repeating ((-c|-e) host port [label])+
+/* Parse: optional -v a, then repeating ((-c|-e) host port [label])+
+ *   -v a                         put VRS target on the first base for backsolve QC
  *   -c <host> <port> [label]   base station (obs + ARP, plus eph if present)
  *   -e <host> <port> [label]   corrections stream: BRDC/SSR only (no obs/ARP) */
 static int parse_client_streams(int argc, char **argv, cli_stream_t *out, int max_n)
 {
     int i = 1, n = 0;
 
+    g_target_mode = VRS_TARGET_MIDPOINT;
+    if (i + 1 < argc && strcmp(argv[i], "-v") == 0) {
+        if (strcmp(argv[i + 1], "a") != 0)
+            return -1;
+        g_target_mode = VRS_TARGET_BASE_A;
+        i += 2;
+    }
     if (i >= argc || (strcmp(argv[i], "-c") != 0 && strcmp(argv[i], "-e") != 0))
         return -1;
 
@@ -1859,9 +2856,10 @@ static int run_multi_client(int argc, char **argv)
     printf("Client mode: %d TCP stream(s) in this process (base=%d, correction-only=%d).\n",
            n, nbase, neph);
     if (nbase >= 2) {
-        printf("RTCM 1005 ARP from base streams -> midpoint ECEF; input MSM epochs are not printed.\n");
-        printf("Synthetic midpoint RTCM (1005 + MSM7) is sent on TCP port %u (one client at a time).\n",
-               (unsigned)RTCM_OUT_PORT);
+        printf("RTCM 1005 ARP from base streams -> target=%s ECEF; input MSM epochs are not printed.\n",
+               target_mode_name(g_target_mode));
+        printf("Synthetic %s RTCM (1005 + MSM7) is sent on TCP port %u (one client at a time).\n",
+               target_mode_name(g_target_mode), (unsigned)RTCM_OUT_PORT);
     }
     if (neph > 0)
         printf("Correction-only stream(s) feed and forward BRDC/SSR, e.g. SSRC00CNE0 (no obs/ARP used).\n");
@@ -2053,7 +3051,8 @@ static void usage(void)
     fprintf(stderr,
             "usage:\n"
             "  ntrip_rtcm_obs [listen_port] [label]     TCP server (default port %d)\n"
-            "  ntrip_rtcm_obs (-c|-e) <host> <port> [label] [(-c|-e) <host> <port> [label] ...]\n"
+            "  ntrip_rtcm_obs [-v a] (-c|-e) <host> <port> [label] [(-c|-e) <host> <port> [label] ...]\n"
+            "      -v a put the virtual point on the first base for backsolve validation\n"
             "      -c   base station stream  (obs + ARP, eph also accepted)\n"
             "      -e   BRDC/SSR correction stream, e.g. SSRC00CNE0 (no obs/ARP used)\n"
             "      Multiple streams run in one process (one thread each).\n"
@@ -2066,7 +3065,9 @@ int main(int argc, char **argv)
     unsigned short port = DEFAULT_PORT;
     const char *label = NULL;
 
-    if (argc >= 2 && (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "-e") == 0))
+    if (argc >= 2 && (strcmp(argv[1], "-v") == 0 ||
+                      strcmp(argv[1], "-c") == 0 ||
+                      strcmp(argv[1], "-e") == 0))
         return run_multi_client(argc, argv) ? 1 : 0;
 
     if (argc >= 2) {

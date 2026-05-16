@@ -75,7 +75,7 @@
 *                           suppress warning for buffer overflow by sprintf()
 *                           use integer types in stdint.h
 *-----------------------------------------------------------------------------*/
-#define _POSIX_C_SOURCE 199506
+#define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include "rtklib.h"
 #ifndef WIN32
@@ -361,10 +361,28 @@ static serial_t *openserial(const char *path, int mode, char *msg)
 #ifdef __APPLE__
     /* MacOS doesn't support higher baudrates (>230400B) */
     const int br[]={
-        300,600,1200,2400,4800,9600,19200,38400,57600,115200,230400
+        300,600,1200,2400,4800,9600,19200,38400
+#ifdef B57600
+        ,57600
+#endif
+#ifdef B115200
+        ,115200
+#endif
+#ifdef B230400
+        ,230400
+#endif
     };
     const speed_t bs[]={
-        B300,B600,B1200,B2400,B4800,B9600,B19200,B38400,B57600,B115200,B230400
+        B300,B600,B1200,B2400,B4800,B9600,B19200,B38400
+#ifdef B57600
+        ,B57600
+#endif
+#ifdef B115200
+        ,B115200
+#endif
+#ifdef B230400
+        ,B230400
+#endif
     };
 #else /* regular Linux with higher baudrates */
     const int br[]={
@@ -1155,7 +1173,7 @@ static int gentcp(tcp_t *tcp, int type, char *msg)
             tcp->tdis=tickget();
             return 0;
         }
-        memcpy(&tcp->addr.sin_addr,hp->h_addr,hp->h_length);
+        memcpy(&tcp->addr.sin_addr,hp->h_addr_list[0],hp->h_length);
     }
     tcp->state=1;
     tcp->tact=tickget();
@@ -2130,7 +2148,7 @@ static udp_t *genudp(int type, int port, const char *saddr, char *msg)
             free(udp);
             return NULL;
         }
-        memcpy(&udp->addr.sin_addr,hp->h_addr,hp->h_length);
+        memcpy(&udp->addr.sin_addr,hp->h_addr_list[0],hp->h_length);
     }
     return udp;
 }
