@@ -146,6 +146,125 @@ typedef enum {
 2. `union_mode_controller` 依据质量门限决定输出模式。
 3. `rtcm_output_encoder` 只关心已经批准发布的观测，不承担数学策略判断。
 
+### 5.4 方案 B 模块设计图
+
+```mermaid
+flowchart LR
+    OBS["A/B common carrier observations"] --> AMB["Ambiguity Manager"]
+    GEO["Geometry Service"] --> AMB
+    AMB --> BASE["Baseline Fix State Machine"]
+    BASE --> CLK["Phase Clock-Difference Estimator"]
+    OBS --> CLK
+    GEO --> CLK
+    CLK --> SPLIT["Phase Bias Splitter"]
+    SPLIT --> BTRANSFER["B-only Phase Transfer"]
+    BIAS["Per-signal Phase Hardware Bias"] --> SPLIT
+    BASE --> GATE["Union Mode Controller"]
+    CLK --> GATE
+    BTRANSFER --> GATE
+    GATE --> OUT["RTCM Publisher"]
+```
+
+### 5.5 方案 B 数据流图
+
+```mermaid
+flowchart TD
+    E0["Epoch pair"] --> E1["Visibility classifier"]
+    E1 --> E2["Common satellite set"]
+    E2 --> E3["DD ambiguity fixing"]
+    E3 --> E4{"Fixed common sats >= 4?"}
+    E4 -- "No" --> D0["baseline_state = acquiring/degraded"]
+    E4 -- "Yes" --> E5["baseline_state = fixed"]
+    E5 --> E6["Estimate c(dt_A-dt_B) per epoch"]
+    E6 --> E7{"clock sigma / age pass?"}
+    E7 -- "No" --> D1["keep B-only carrier blocked"]
+    E7 -- "Yes" --> E8["Remove phase clock difference from B frame"]
+    E8 --> E9["Apply per-signal hardware phase bias"]
+    E9 --> E10["Publish B-only carrier candidate"]
+    D0 --> OUT["common-only / code-only union"]
+    D1 --> OUT
+    E10 --> OUT["union publish plan"]
+```
+
+这两张图把方案 B 拆成了三层：
+
+1. `baseline_fix_state_machine`：只回答“当前双站载波关系是否已经稳定到可以相信”。
+2. `phase_clock_difference_estimator`：只估计逐历元的 `c(dt_A-dt_B)`。
+3. `phase_bias_splitter`：把全局钟差项和按频点的残余相位偏差拆开，避免继续混在同一个 `phase_bias_ab_cyc` 里。
+
+这样做的好处是：
+
+1. `baseline fixed` 不再是“坐标存在即固定”的占位布尔值。
+2. 即使未来 `B-only` 载波仍暂时不放行，公共卫星侧的钟差估计器也能先独立验证。
+3. 当质量不够时，系统可以明确退回 `common-only`，而不是把失败混进发布层。
+
+### 5.6 当前实现约束
+
+目前阶段 3 的第一版 `phase_clock_difference_estimator` 采用“码钟差锚定 + 相位整周展开”的办法：
+
+1. 先从每个 `(system, code)` 的公共卫星中估计原始相位框架偏移。
+2. 以同星座的码钟差 `clk_B - clk_A` 为粗锚点，将相位偏移按波长展开到最接近的整周分支。
+3. 对同星座可用信号取中值，得到逐历元 `phase_clock_ab_m`。
+4. 再从每个信号的原始相位框架偏移中扣除该公共钟差，剩下的部分记为 `phase_resid_bias_ab_cyc`。
+
+这个残余项目前仍包含参考星单差模糊度常数与频点相关偏差，并不应被解释成纯硬件延迟。当前实现已经把“逐历元公共项”和“按频点残余项”分开，但它仍依赖码钟差做整周分支选择；在真正放开 `B-only` 载波前，还需要继续做：
+
+1. 长时间连续性检查。
+2. 参考星切换时的稳定性检查。
+3. 码钟差异常时的拒绝逻辑。
+
+### 5.7 当前门控策略
+
+`phase_clock_difference_estimator` 进入“可用”状态前，必须同时满足：
+
+1. `baseline_state = fixed`
+2. 当前星座至少存在可用公共相位信号
+3. 相位样本离散度 `sigma <= 0.10 m`
+4. 相位钟差与码钟差锚点的差值绝对值 `<= 0.15 m`
+5. 相邻历元的相位变化相对码锚变化创新量 `<= 0.15 m`
+6. 当前历元没有参考星切换
+7. 连续通过 3 个历元
+
+只有满足以上条件，`phase_clock_diff_state` 才会从“能算”升级为“可用”。
+
+### 5.8 B-only 载波的对称映射
+
+进一步把 common 载波的参考框架写开后，可以得到一个更准确的结论：
+
+1. common 载波当前本质上位于 A/B 两个相位参考帧的平均框架。
+2. 因此 A-only 载波若要进入这个框架，应使用 `+0.5 * frame_offset`。
+3. B-only 载波若要进入同一框架，应使用 `-0.5 * frame_offset`。
+
+这意味着 B-only 并不一定需要先构造一个并不存在的 `N_A^s - N_B^s`；  
+它可以依靠：
+
+1. 公共卫星给出的逐历元相位钟差
+2. 对应频点的相位残余项
+3. B 站自身相对公共参考星的同接收机单差整数关系
+
+进入与 common 一致的半平均整数框架。
+
+### 5.9 当前仍然只做 dry-run 的原因
+
+虽然对称映射在代数上成立，但正式放行前仍需先证明两件事：
+
+1. B-only 到 B 站参考星的单差，在扣除几何与大气模型后确实稳定接近整数。
+2. `-0.5 * frame_offset` 映射在基站回代场景下不会破坏自洽性。
+
+因此当前实现将 B-only 载波推进到 `dry-run`：
+
+1. 统计可对称映射的信号数。
+2. 统计可被 B 站单差固定的桥接数。
+3. 在 `-v b` 回代模式下检查映射后的自洽误差。
+4. 使用多历元 bridge 状态机做防抖：
+   - 候选桥接数至少 `3`
+   - 当前历元必须 `3/3` 全部固定
+   - `bridgeRms <= 0.15 cyc`
+   - 连续 `3` 个历元满足后才进入 `fixed`
+   - 已固定后允许最多 `2` 个坏历元进入 `degraded`
+
+只有这些诊断长期稳定后，才进入正式发布门控。
+
 ---
 
 ## 6. 四阶段实现路线图

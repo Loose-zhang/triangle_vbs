@@ -85,11 +85,23 @@ typedef int sock_t;
 #define VRS_MAX_EPOCH_SKEW 0.001
 #define VRS_MAX_BASELINE_M 5000.0
 #define VRS_MIN_COMMON_FOR_UNION 4
+#define VRS_MIN_BASELINE_FIXED_SATS 4
+#define VRS_BASELINE_FIX_STREAK 3
+#define VRS_BASELINE_HOLD_BAD_EPOCHS 2
 #define VRS_MAX_UNION_RMS_M 1.0
 #define VRS_MIN_CODE_BIAS_SATS 2
 #define VRS_MAX_CODE_BIAS_SIGMA_M 3.0
 #define VRS_MIN_PHASE_BIAS_SATS 2
 #define VRS_MAX_PHASE_BIAS_SIGMA_CYC 0.10
+#define VRS_MIN_PHASE_CLOCK_SIGNALS 1
+#define VRS_MAX_PHASE_CLOCK_SIGMA_M 0.10
+#define VRS_PHASE_CLOCK_FIX_STREAK 3
+#define VRS_MAX_PHASE_CLOCK_ANCHOR_RESID_M 0.15
+#define VRS_MAX_PHASE_CLOCK_INNOV_M 0.15
+#define VRS_MIN_B_ONLY_BRIDGE_CANDIDATES 3
+#define VRS_MAX_B_ONLY_BRIDGE_RMS_CYC 0.15
+#define VRS_B_ONLY_BRIDGE_FIX_STREAK 3
+#define VRS_B_ONLY_BRIDGE_HOLD_BAD_EPOCHS 2
 #define STREAM_THREAD_STACK_SIZE (8u * 1024u * 1024u)
 
 typedef struct {
@@ -187,7 +199,8 @@ typedef enum {
 
 typedef enum {
     VRS_TARGET_MIDPOINT = 0,
-    VRS_TARGET_BASE_A
+    VRS_TARGET_BASE_A,
+    VRS_TARGET_BASE_B
 } vrs_target_mode_t;
 
 typedef enum {
@@ -199,10 +212,34 @@ typedef enum {
     UNION_REASON_NO_EXTRA
 } union_reason_t;
 
+typedef enum {
+    BASELINE_STATE_INVALID = 0,
+    BASELINE_STATE_ACQUIRING,
+    BASELINE_STATE_FIXED,
+    BASELINE_STATE_DEGRADED
+} baseline_fix_state_t;
+
+typedef enum {
+    BASELINE_REASON_OK = 0,
+    BASELINE_REASON_GEOMETRY,
+    BASELINE_REASON_NO_EPH,
+    BASELINE_REASON_PHASE_SUPPORT,
+    BASELINE_REASON_ACQUIRING,
+    BASELINE_REASON_DEGRADED
+} baseline_reason_t;
+
 typedef struct {
     int valid;
     int fixed;
+    baseline_fix_state_t state;
+    baseline_reason_t reason;
     double length_m;
+    int fixed_phase_sats;
+    int fixed_phase_obs;
+    int fix_streak;
+    int bad_streak;
+    gtime_t last_update;
+    gtime_t last_fixed;
 } baseline_state_t;
 
 typedef struct {
@@ -231,11 +268,49 @@ typedef struct {
     double code_bias_ab_m[7][MAXCODE]; /* B frame minus A frame */
     double code_sigma_m[7][MAXCODE];
     int code_n[7][MAXCODE];
-    int phase_valid[7][MAXCODE];
-    double phase_bias_ab_cyc[7][MAXCODE]; /* B-aligned frame minus A frame */
-    double phase_sigma_cyc[7][MAXCODE];
+    int phase_frame_valid[7][MAXCODE];
+    double phase_frame_ab_cyc[7][MAXCODE]; /* raw B-aligned frame minus A frame */
+    double phase_frame_sigma_cyc[7][MAXCODE];
+    double phase_lambda_m[7][MAXCODE];
+    int phase_resid_valid[7][MAXCODE];
+    double phase_resid_bias_ab_cyc[7][MAXCODE]; /* residual after phase clock removal */
     int phase_n[7][MAXCODE];
 } cross_source_bias_state_t;
+
+typedef struct {
+    int raw_valid[7];
+    int usable[7];
+    double clock_ab_m[7];      /* B minus A, code-anchored carrier estimate */
+    double sigma_m[7];
+    double code_anchor_ab_m[7];
+    double anchor_resid_m[7];
+    double innovation_m[7];
+    int n_signal[7];
+    int n_phase_obs[7];
+    int stable_streak[7];
+    int bad_streak[7];
+    int reason[7];
+    gtime_t time;
+} phase_clock_diff_state_t;
+
+typedef enum {
+    PHASE_CLOCK_REASON_OK = 0,
+    PHASE_CLOCK_REASON_BASELINE,
+    PHASE_CLOCK_REASON_NO_SIGNAL,
+    PHASE_CLOCK_REASON_SIGMA,
+    PHASE_CLOCK_REASON_ANCHOR,
+    PHASE_CLOCK_REASON_REF_SWITCH,
+    PHASE_CLOCK_REASON_INNOV,
+    PHASE_CLOCK_REASON_ACQUIRING
+} phase_clock_reason_t;
+
+typedef struct {
+    int has_prev;
+    double last_clock_ab_m;
+    double last_anchor_ab_m;
+    int stable_streak;
+    int bad_streak;
+} phase_clock_track_t;
 
 typedef struct {
     vrs_mode_t mode;
@@ -255,12 +330,58 @@ typedef struct {
     double rms_self_l_cyc;
 } backsolve_qc_t;
 
+typedef struct {
+    int n_candidate;
+    int n_clock_ready;
+    int n_resid_ready;
+    int n_symmetric_ready;
+    int n_bridge_candidate;
+    int n_bridge_fixed;
+    int n_self_l;
+    double rms_bridge_resid_cyc;
+    double rms_self_l_cyc;
+} b_only_phase_dryrun_t;
+
+typedef enum {
+    B_ONLY_BRIDGE_STATE_INVALID = 0,
+    B_ONLY_BRIDGE_STATE_ACQUIRING,
+    B_ONLY_BRIDGE_STATE_FIXED,
+    B_ONLY_BRIDGE_STATE_DEGRADED
+} b_only_bridge_state_kind_t;
+
+typedef enum {
+    B_ONLY_BRIDGE_REASON_OK = 0,
+    B_ONLY_BRIDGE_REASON_NO_CANDIDATE,
+    B_ONLY_BRIDGE_REASON_NOT_ENOUGH,
+    B_ONLY_BRIDGE_REASON_NOT_ALL_FIXED,
+    B_ONLY_BRIDGE_REASON_RMS,
+    B_ONLY_BRIDGE_REASON_ACQUIRING,
+    B_ONLY_BRIDGE_REASON_DEGRADED
+} b_only_bridge_reason_t;
+
+typedef struct {
+    int valid;
+    int fixed;
+    b_only_bridge_state_kind_t state;
+    b_only_bridge_reason_t reason;
+    int n_candidate;
+    int n_fixed;
+    double rms_resid_cyc;
+    int fix_streak;
+    int bad_streak;
+    gtime_t last_update;
+    gtime_t last_fixed;
+} b_only_bridge_state_t;
+
 static epoch_snap_t g_epoch_snap[MAX_CLIENT_STREAMS];
 static gtime_t g_last_synth_epoch;
 static int g_have_synth_epoch;
 static gtime_t g_last_station_tx_epoch;
 static int g_have_station_tx_epoch;
 static int g_ssr_nmsg;
+static baseline_state_t g_baseline_state;
+static phase_clock_track_t g_phase_clock_track[7];
+static b_only_bridge_state_t g_b_only_bridge_state;
 
 static int g_suppress_input_obs;
 static vrs_target_mode_t g_target_mode = VRS_TARGET_MIDPOINT;
@@ -273,6 +394,10 @@ static sock_t g_tx_conn = SOCK_INVALID;
 
 static void print_enter(void);
 static void print_leave(void);
+static const char *phase_clock_reason_name(int reason);
+static int phase_total_offset_cyc(
+    int sb, int ci, const cross_source_bias_state_t *bias,
+    const phase_clock_diff_state_t *phase_clock, double *out);
 
 static void print_init(void)
 {
@@ -1925,6 +2050,223 @@ static void print_code_bias_diag(const cross_source_bias_state_t *bias)
     printf("\n");
 }
 
+static void print_phase_clock_diag(
+    const cross_source_bias_state_t *bias, const phase_clock_diff_state_t *clock)
+{
+    int sb, ci, any_clock = 0, any_phase = 0;
+
+    if (!bias || !clock) return;
+    for (sb = 0; sb < 7; sb++) {
+        if (clock->n_signal[sb] > 0) any_clock = 1;
+        for (ci = 0; ci < MAXCODE; ci++) {
+            if (bias->phase_n[sb][ci] > 0) any_phase = 1;
+        }
+    }
+    if (!any_clock && !any_phase) return;
+
+    if (any_clock) {
+        printf("  phase-clock:");
+        for (sb = 0; sb < 7; sb++) {
+            if (clock->n_signal[sb] <= 0) continue;
+            printf(" %s:ab=%+.4fm anchor=%+.4fm ares=%+.4f innov=%+.4f sigma=%.4f sig=%d obs=%d raw=%d usable=%d streak=%d bad=%d reason=%s;",
+                   sys_bit_name(sb), clock->clock_ab_m[sb],
+                   clock->code_anchor_ab_m[sb], clock->anchor_resid_m[sb],
+                   clock->innovation_m[sb], clock->sigma_m[sb],
+                   clock->n_signal[sb], clock->n_phase_obs[sb],
+                   clock->raw_valid[sb], clock->usable[sb],
+                   clock->stable_streak[sb], clock->bad_streak[sb],
+                   phase_clock_reason_name(clock->reason[sb]));
+        }
+        printf("\n");
+    }
+    if (any_phase) {
+        printf("  phase-split:");
+        for (sb = 0; sb < 7; sb++) {
+            for (ci = 0; ci < MAXCODE; ci++) {
+                if (bias->phase_n[sb][ci] <= 0) continue;
+                printf(" %s/%s:n=%d frame=%+.4fcyc sigma=%.4f resid=%+.4f valid=%d;",
+                       sys_bit_name(sb), code2obs((uint8_t)(ci + 1)),
+                       bias->phase_n[sb][ci],
+                       bias->phase_frame_ab_cyc[sb][ci],
+                       bias->phase_frame_sigma_cyc[sb][ci],
+                       bias->phase_resid_bias_ab_cyc[sb][ci],
+                       bias->phase_resid_valid[sb][ci]);
+            }
+        }
+        printf("\n");
+    }
+}
+
+static void inspect_b_only_phase_dryrun(
+    const virt_obs_t *src, int n_src,
+    const cross_source_bias_state_t *bias,
+    const phase_clock_diff_state_t *phase_clock,
+    const epoch_pair_t *pair,
+    b_only_phase_dryrun_t *out)
+{
+    int i, j;
+    static single_geom_t geom_b[MAXOBS];
+    int have_geom_b = 0;
+    double sum_bridge_resid2 = 0.0;
+    double sum_self_l2 = 0.0;
+
+    memset(out, 0, sizeof(*out));
+    if (pair)
+        have_geom_b = prepare_single_source_geometry(
+            pair->b, g_arp_ecef[1], g_arp_ecef[1], geom_b);
+    for (i = 0; i < n_src; i++) {
+        int sys, prn, sb;
+        const obsd_t *b = NULL;
+        int ib = -1;
+        if (src[i].source != SRC_B_ONLY) continue;
+        sys = satsys(src[i].obs.sat, &prn); (void)prn;
+        sb = sys_bit_index(sys);
+        if (sb < 0) continue;
+        if (pair && g_target_mode == VRS_TARGET_BASE_B) {
+            ib = find_sat_in_snap(pair->b, src[i].obs.sat);
+            if (ib >= 0) b = &pair->b->data[ib];
+        }
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            int ci;
+            double phase_total_cyc;
+            if (src[i].obs.L[j] == 0.0 || src[i].obs.code[j] == CODE_NONE) continue;
+            ci = (int)src[i].obs.code[j] - 1;
+            if (ci < 0 || ci >= MAXCODE) continue;
+            out->n_candidate++;
+            if (phase_clock && phase_clock->usable[sb])
+                out->n_clock_ready++;
+            if (bias && bias->phase_resid_valid[sb][ci])
+                out->n_resid_ready++;
+            if (phase_total_offset_cyc(sb, ci, bias, phase_clock,
+                                       &phase_total_cyc)) {
+                out->n_symmetric_ready++;
+                if (pair && have_geom_b) {
+                    int idx_b = find_sat_in_snap(pair->b, src[i].obs.sat);
+                    int ref_sat = g_ref_sat[sb][ci];
+                    int ref_idx_b = ref_sat > 0 ? find_sat_in_snap(pair->b, ref_sat) : -1;
+                    if (idx_b >= 0 && ref_idx_b >= 0 &&
+                        geom_b[idx_b].valid && geom_b[ref_idx_b].valid) {
+                        const obsd_t *bs = &pair->b->data[idx_b];
+                        const obsd_t *br = &pair->b->data[ref_idx_b];
+                        int js = find_same_code_idx(bs, src[i].obs.code[j]);
+                        int jr = find_same_code_idx(br, src[i].obs.code[j]);
+                        double freq = code2freq(sys, src[i].obs.code[j], src[i].obs.freq);
+                        double lam = freq > 0.0 ? CLIGHT / freq : 0.0;
+                        if (js >= 0 && jr >= 0 &&
+                            bs->L[js] != 0.0 && br->L[jr] != 0.0 && lam > 0.0) {
+                            double metric_sd =
+                                (geom_b[idx_b].rho_src - geom_b[ref_idx_b].rho_src)
+                              - CLIGHT * (geom_b[idx_b].dts0 - geom_b[ref_idx_b].dts0)
+                              - (geom_b[idx_b].ion_src - geom_b[ref_idx_b].ion_src)
+                              + (geom_b[idx_b].trp_src - geom_b[ref_idx_b].trp_src);
+                            double sd_float = (bs->L[js] - br->L[jr]) - metric_sd / lam;
+                            double sd_int = floor(sd_float + 0.5);
+                            double resid = sd_float - sd_int;
+                            out->n_bridge_candidate++;
+                            sum_bridge_resid2 += resid * resid;
+                            if (fabs(resid) <= VRS_AMB_FIX_THRES)
+                                out->n_bridge_fixed++;
+                        }
+                    }
+                }
+                if (b) {
+                    int jb = find_same_code_idx(b, src[i].obs.code[j]);
+                    if (jb >= 0 && b->L[jb] != 0.0) {
+                        double mapped = src[i].obs.L[j] - 0.5 * phase_total_cyc;
+                        double expected = b->L[jb] - 0.5 * phase_total_cyc;
+                        double d = mapped - expected;
+                        sum_self_l2 += d * d;
+                        out->n_self_l++;
+                    }
+                }
+            }
+        }
+    }
+    out->rms_bridge_resid_cyc =
+        out->n_bridge_candidate > 0
+            ? sqrt(sum_bridge_resid2 / out->n_bridge_candidate)
+            : 0.0;
+    out->rms_self_l_cyc =
+        out->n_self_l > 0 ? sqrt(sum_self_l2 / out->n_self_l) : 0.0;
+}
+
+static void print_b_only_phase_dryrun_diag(const b_only_phase_dryrun_t *dryrun)
+{
+    if (!dryrun || dryrun->n_candidate <= 0) return;
+    printf("  b-only-phase-dryrun: cand=%d clockReady=%d residReady=%d symmetricReady=%d bridge=%d/%d bridgeRms=%.4fcyc selfL=%.6fcyc/%d\n",
+           dryrun->n_candidate, dryrun->n_clock_ready,
+           dryrun->n_resid_ready, dryrun->n_symmetric_ready,
+           dryrun->n_bridge_fixed, dryrun->n_bridge_candidate,
+           dryrun->rms_bridge_resid_cyc,
+           dryrun->rms_self_l_cyc, dryrun->n_self_l);
+}
+
+static b_only_bridge_state_t update_b_only_bridge_state(
+    const b_only_phase_dryrun_t *dryrun, gtime_t epoch_time)
+{
+    b_only_bridge_state_t *s = &g_b_only_bridge_state;
+    int enough = dryrun &&
+                 dryrun->n_bridge_candidate >= VRS_MIN_B_ONLY_BRIDGE_CANDIDATES;
+    int all_fixed = dryrun &&
+                    dryrun->n_bridge_candidate > 0 &&
+                    dryrun->n_bridge_fixed == dryrun->n_bridge_candidate;
+    int low_rms = dryrun &&
+                  dryrun->n_bridge_candidate > 0 &&
+                  dryrun->rms_bridge_resid_cyc <= VRS_MAX_B_ONLY_BRIDGE_RMS_CYC;
+    int pass = enough && all_fixed && low_rms;
+
+    s->last_update = epoch_time;
+    s->valid = dryrun && dryrun->n_bridge_candidate > 0;
+    s->fixed = 0;
+    s->n_candidate = dryrun ? dryrun->n_bridge_candidate : 0;
+    s->n_fixed = dryrun ? dryrun->n_bridge_fixed : 0;
+    s->rms_resid_cyc = dryrun ? dryrun->rms_bridge_resid_cyc : 0.0;
+
+    if (!s->valid) {
+        s->state = B_ONLY_BRIDGE_STATE_INVALID;
+        s->reason = B_ONLY_BRIDGE_REASON_NO_CANDIDATE;
+        s->fix_streak = 0;
+        s->bad_streak = 0;
+        return *s;
+    }
+
+    if (pass) {
+        s->fix_streak++;
+        s->bad_streak = 0;
+        if (s->state == B_ONLY_BRIDGE_STATE_FIXED ||
+            s->state == B_ONLY_BRIDGE_STATE_DEGRADED ||
+            s->fix_streak >= VRS_B_ONLY_BRIDGE_FIX_STREAK) {
+            s->state = B_ONLY_BRIDGE_STATE_FIXED;
+            s->reason = B_ONLY_BRIDGE_REASON_OK;
+            s->fixed = 1;
+            s->last_fixed = epoch_time;
+        }
+        else {
+            s->state = B_ONLY_BRIDGE_STATE_ACQUIRING;
+            s->reason = B_ONLY_BRIDGE_REASON_ACQUIRING;
+        }
+        return *s;
+    }
+
+    s->fix_streak = 0;
+    s->bad_streak++;
+    if (s->state == B_ONLY_BRIDGE_STATE_FIXED &&
+        s->bad_streak <= VRS_B_ONLY_BRIDGE_HOLD_BAD_EPOCHS) {
+        s->state = B_ONLY_BRIDGE_STATE_DEGRADED;
+        s->reason = B_ONLY_BRIDGE_REASON_DEGRADED;
+        return *s;
+    }
+
+    s->state = B_ONLY_BRIDGE_STATE_ACQUIRING;
+    if (!enough)
+        s->reason = B_ONLY_BRIDGE_REASON_NOT_ENOUGH;
+    else if (!all_fixed)
+        s->reason = B_ONLY_BRIDGE_REASON_NOT_ALL_FIXED;
+    else
+        s->reason = B_ONLY_BRIDGE_REASON_RMS;
+    return *s;
+}
+
 static int transfer_single_source_candidates(
     const epoch_pair_t *pair, const visibility_set_t *vis,
     sat_source_t source, const double r_src[3], const double r_v[3],
@@ -2009,16 +2351,97 @@ static void assemble_shadow_union_candidates(
     }
 }
 
-static baseline_state_t make_baseline_state(double length_m)
+static int obs_has_carrier(const obsd_t *obs)
 {
-    baseline_state_t s;
+    int j;
+    if (!obs) return 0;
+    for (j = 0; j < NFREQ + NEXOBS; j++) {
+        if (obs->L[j] != 0.0) return 1;
+    }
+    return 0;
+}
 
-    memset(&s, 0, sizeof(s));
-    s.length_m = length_m;
-    s.valid = length_m > 0.0 && length_m <= VRS_MAX_BASELINE_M;
-    /* Stage 3 uses surveyed 1005/1006 ARPs as the fixed baseline source. */
-    s.fixed = s.valid;
-    return s;
+static int count_fixed_phase_sats(const obsd_t *obs, int n)
+{
+    int i, count = 0;
+    for (i = 0; i < n; i++) {
+        if (obs_has_carrier(&obs[i])) count++;
+    }
+    return count;
+}
+
+static int count_fixed_phase_obs(const obsd_t *obs, int n)
+{
+    int i, j, count = 0;
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < NFREQ + NEXOBS; j++) {
+            if (obs[i].L[j] != 0.0) count++;
+        }
+    }
+    return count;
+}
+
+static baseline_state_t update_baseline_state(
+    double length_m, int used_eph, const obsd_t *common, int n_common,
+    gtime_t epoch_time)
+{
+    baseline_state_t *s = &g_baseline_state;
+    int geometry_valid = length_m > 0.0 && length_m <= VRS_MAX_BASELINE_M;
+    int fixed_phase_sats = used_eph ? count_fixed_phase_sats(common, n_common) : 0;
+    int fixed_phase_obs = used_eph ? count_fixed_phase_obs(common, n_common) : 0;
+    int has_phase_support = fixed_phase_sats >= VRS_MIN_BASELINE_FIXED_SATS;
+
+    s->length_m = length_m;
+    s->last_update = epoch_time;
+    s->fixed_phase_sats = fixed_phase_sats;
+    s->fixed_phase_obs = fixed_phase_obs;
+    s->valid = geometry_valid;
+    s->fixed = 0;
+
+    if (!geometry_valid) {
+        s->state = BASELINE_STATE_INVALID;
+        s->reason = BASELINE_REASON_GEOMETRY;
+        s->fix_streak = 0;
+        s->bad_streak = 0;
+        return *s;
+    }
+    if (!used_eph) {
+        s->state = BASELINE_STATE_ACQUIRING;
+        s->reason = BASELINE_REASON_NO_EPH;
+        s->fix_streak = 0;
+        s->bad_streak++;
+        return *s;
+    }
+    if (has_phase_support) {
+        s->fix_streak++;
+        s->bad_streak = 0;
+        if (s->state == BASELINE_STATE_FIXED ||
+            s->state == BASELINE_STATE_DEGRADED ||
+            s->fix_streak >= VRS_BASELINE_FIX_STREAK) {
+            s->state = BASELINE_STATE_FIXED;
+            s->reason = BASELINE_REASON_OK;
+            s->fixed = 1;
+            s->last_fixed = epoch_time;
+        }
+        else {
+            s->state = BASELINE_STATE_ACQUIRING;
+            s->reason = BASELINE_REASON_ACQUIRING;
+        }
+        return *s;
+    }
+
+    s->fix_streak = 0;
+    s->bad_streak++;
+    if (s->state == BASELINE_STATE_FIXED &&
+        s->bad_streak <= VRS_BASELINE_HOLD_BAD_EPOCHS) {
+        s->state = BASELINE_STATE_DEGRADED;
+        s->reason = BASELINE_REASON_DEGRADED;
+    }
+    else {
+        s->state = BASELINE_STATE_ACQUIRING;
+        s->reason = BASELINE_REASON_PHASE_SUPPORT;
+    }
+    return *s;
 }
 
 static void estimate_cross_source_bias(
@@ -2083,6 +2506,8 @@ static void estimate_cross_source_bias(
             freq = code2freq(sys, d0->code[j], d0->freq);
             lam = freq > 0.0 ? CLIGHT / freq : 0.0;
             if (lam <= 0.0) continue;
+            if (out->phase_lambda_m[sb][ci] <= 0.0)
+                out->phase_lambda_m[sb][ci] = lam;
 
             l_a_at_v = d0->L[j] + (g->rho_V - g->rho_A) / lam;
             l_b_aligned_at_v = d1->L[j1] + a->dd_n
@@ -2128,17 +2553,160 @@ static void estimate_cross_source_bias(
                 sum2 += d * d;
             }
             sigma = sqrt(sum2 / n);
-            out->phase_bias_ab_cyc[sb][ci] = med;
-            out->phase_sigma_cyc[sb][ci] = sigma;
+            out->phase_frame_ab_cyc[sb][ci] = med;
+            out->phase_frame_sigma_cyc[sb][ci] = sigma;
             if (sigma <= VRS_MAX_PHASE_BIAS_SIGMA_CYC)
-                out->phase_valid[sb][ci] = 1;
+                out->phase_frame_valid[sb][ci] = 1;
         }
     }
+}
+
+static void estimate_phase_clock_difference(
+    const common_cal_t *cal, const baseline_state_t *baseline,
+    cross_source_bias_state_t *bias, gtime_t epoch_time, int ref_switches,
+    phase_clock_diff_state_t *out)
+{
+    static double samples[7][MAXCODE];
+    static double tmp[MAXCODE];
+    int sb, ci, j;
+
+    memset(out, 0, sizeof(*out));
+    out->time = epoch_time;
+    for (sb = 0; sb < 7; sb++)
+        out->reason[sb] = PHASE_CLOCK_REASON_NO_SIGNAL;
+    if (!cal || !baseline || !bias || !baseline->fixed) {
+        for (sb = 0; sb < 7; sb++)
+            out->reason[sb] = PHASE_CLOCK_REASON_BASELINE;
+        return;
+    }
+
+    for (sb = 0; sb < 7; sb++) {
+        double anchor_m;
+        int n = 0;
+
+        if (!cal->clock_valid[sb]) continue;
+        anchor_m = cal->clk_b_sys[sb] - cal->clk_a_sys[sb];
+        out->code_anchor_ab_m[sb] = anchor_m;
+
+        for (ci = 0; ci < MAXCODE; ci++) {
+            double lam, raw_m, unwrap_m;
+            if (!bias->phase_frame_valid[sb][ci]) continue;
+            lam = bias->phase_lambda_m[sb][ci];
+            if (lam <= 0.0) continue;
+            raw_m = bias->phase_frame_ab_cyc[sb][ci] * lam;
+            unwrap_m = raw_m + floor((anchor_m - raw_m) / lam + 0.5) * lam;
+            samples[sb][n++] = unwrap_m;
+            out->n_phase_obs[sb] += bias->phase_n[sb][ci];
+        }
+        out->n_signal[sb] = n;
+        if (n < VRS_MIN_PHASE_CLOCK_SIGNALS) continue;
+
+        memcpy(tmp, samples[sb], (size_t)n * sizeof(double));
+        out->clock_ab_m[sb] = median_of(tmp, n);
+        {
+            double sum2 = 0.0;
+            for (j = 0; j < n; j++) {
+                double d = samples[sb][j] - out->clock_ab_m[sb];
+                sum2 += d * d;
+            }
+            out->sigma_m[sb] = sqrt(sum2 / n);
+        }
+        out->anchor_resid_m[sb] =
+            out->clock_ab_m[sb] - out->code_anchor_ab_m[sb];
+        if (out->sigma_m[sb] <= VRS_MAX_PHASE_CLOCK_SIGMA_M)
+            out->raw_valid[sb] = 1;
+        else
+            out->reason[sb] = PHASE_CLOCK_REASON_SIGMA;
+    }
+
+    for (sb = 0; sb < 7; sb++) {
+        phase_clock_track_t *track = &g_phase_clock_track[sb];
+        int pass = 0;
+
+        if (!out->raw_valid[sb]) {
+            track->stable_streak = 0;
+            track->bad_streak++;
+            out->stable_streak[sb] = track->stable_streak;
+            out->bad_streak[sb] = track->bad_streak;
+            continue;
+        }
+        if (fabs(out->anchor_resid_m[sb]) > VRS_MAX_PHASE_CLOCK_ANCHOR_RESID_M) {
+            out->reason[sb] = PHASE_CLOCK_REASON_ANCHOR;
+        }
+        else if (ref_switches > 0) {
+            out->reason[sb] = PHASE_CLOCK_REASON_REF_SWITCH;
+        }
+        else {
+            if (track->has_prev) {
+                out->innovation_m[sb] =
+                    (out->clock_ab_m[sb] - track->last_clock_ab_m)
+                  - (out->code_anchor_ab_m[sb] - track->last_anchor_ab_m);
+                if (fabs(out->innovation_m[sb]) > VRS_MAX_PHASE_CLOCK_INNOV_M)
+                    out->reason[sb] = PHASE_CLOCK_REASON_INNOV;
+                else
+                    pass = 1;
+            }
+            else {
+                pass = 1;
+            }
+        }
+
+        if (pass) {
+            track->stable_streak++;
+            track->bad_streak = 0;
+            track->has_prev = 1;
+            track->last_clock_ab_m = out->clock_ab_m[sb];
+            track->last_anchor_ab_m = out->code_anchor_ab_m[sb];
+            if (track->stable_streak >= VRS_PHASE_CLOCK_FIX_STREAK) {
+                out->usable[sb] = 1;
+                out->reason[sb] = PHASE_CLOCK_REASON_OK;
+            }
+            else {
+                out->reason[sb] = PHASE_CLOCK_REASON_ACQUIRING;
+            }
+        }
+        else {
+            track->stable_streak = 0;
+            track->bad_streak++;
+            track->has_prev = 0;
+        }
+        out->stable_streak[sb] = track->stable_streak;
+        out->bad_streak[sb] = track->bad_streak;
+    }
+
+    for (sb = 0; sb < 7; sb++) {
+        if (!out->usable[sb]) continue;
+        for (ci = 0; ci < MAXCODE; ci++) {
+            double lam;
+            if (!bias->phase_frame_valid[sb][ci]) continue;
+            lam = bias->phase_lambda_m[sb][ci];
+            if (lam <= 0.0) continue;
+            bias->phase_resid_bias_ab_cyc[sb][ci] =
+                bias->phase_frame_ab_cyc[sb][ci] - out->clock_ab_m[sb] / lam;
+            bias->phase_resid_valid[sb][ci] = 1;
+        }
+    }
+}
+
+static int phase_total_offset_cyc(
+    int sb, int ci, const cross_source_bias_state_t *bias,
+    const phase_clock_diff_state_t *phase_clock, double *out)
+{
+    double lam;
+    if (!bias || !phase_clock || !out) return 0;
+    if (sb < 0 || sb >= 7 || ci < 0 || ci >= MAXCODE) return 0;
+    if (!phase_clock->usable[sb] || !bias->phase_resid_valid[sb][ci]) return 0;
+    lam = bias->phase_lambda_m[sb][ci];
+    if (lam <= 0.0) return 0;
+    *out = phase_clock->clock_ab_m[sb] / lam
+         + bias->phase_resid_bias_ab_cyc[sb][ci];
+    return 1;
 }
 
 static int adjust_single_source_for_union(
     const virt_obs_t *src, int n_src,
     const cross_source_bias_state_t *bias,
+    const phase_clock_diff_state_t *phase_clock,
     virt_obs_t *out, int max_out)
 {
     int i, j, n = 0;
@@ -2172,12 +2740,14 @@ static int adjust_single_source_for_union(
                             + sign * 0.5 * bias->code_bias_ab_m[sb][ci];
             }
             if (in->obs.L[j] != 0.0 &&
-                in->source == SRC_A_ONLY &&
-                bias->phase_valid[sb][ci]) {
+                in->source == SRC_A_ONLY) {
+                double phase_total_cyc;
                 /* A is the phase anchor in stage 3. B-only phase still lacks a
                  * per-satellite DD bridge, so it stays out of the union output. */
-                v->obs.L[j] = in->obs.L[j]
-                            + 0.5 * bias->phase_bias_ab_cyc[sb][ci];
+                if (phase_total_offset_cyc(sb, ci, bias, phase_clock,
+                                           &phase_total_cyc)) {
+                    v->obs.L[j] = in->obs.L[j] + 0.5 * phase_total_cyc;
+                }
             }
             if (v->obs.P[j] == 0.0 && v->obs.L[j] == 0.0) continue;
             v->obs.code[j] = in->obs.code[j];
@@ -2265,10 +2835,75 @@ static const char *union_reason_name(union_reason_t reason)
     }
 }
 
+static const char *baseline_state_name(baseline_fix_state_t state)
+{
+    switch (state) {
+    case BASELINE_STATE_INVALID: return "invalid";
+    case BASELINE_STATE_ACQUIRING: return "acquiring";
+    case BASELINE_STATE_FIXED: return "fixed";
+    case BASELINE_STATE_DEGRADED: return "degraded";
+    default: return "unknown";
+    }
+}
+
+static const char *baseline_reason_name(baseline_reason_t reason)
+{
+    switch (reason) {
+    case BASELINE_REASON_OK: return "ok";
+    case BASELINE_REASON_GEOMETRY: return "geometry";
+    case BASELINE_REASON_NO_EPH: return "no-eph";
+    case BASELINE_REASON_PHASE_SUPPORT: return "phase-support";
+    case BASELINE_REASON_ACQUIRING: return "acquiring";
+    case BASELINE_REASON_DEGRADED: return "degraded";
+    default: return "unknown";
+    }
+}
+
+static const char *b_only_bridge_state_name(b_only_bridge_state_kind_t state)
+{
+    switch (state) {
+    case B_ONLY_BRIDGE_STATE_INVALID: return "invalid";
+    case B_ONLY_BRIDGE_STATE_ACQUIRING: return "acquiring";
+    case B_ONLY_BRIDGE_STATE_FIXED: return "fixed";
+    case B_ONLY_BRIDGE_STATE_DEGRADED: return "degraded";
+    default: return "unknown";
+    }
+}
+
+static const char *b_only_bridge_reason_name(b_only_bridge_reason_t reason)
+{
+    switch (reason) {
+    case B_ONLY_BRIDGE_REASON_OK: return "ok";
+    case B_ONLY_BRIDGE_REASON_NO_CANDIDATE: return "no-candidate";
+    case B_ONLY_BRIDGE_REASON_NOT_ENOUGH: return "not-enough";
+    case B_ONLY_BRIDGE_REASON_NOT_ALL_FIXED: return "not-all-fixed";
+    case B_ONLY_BRIDGE_REASON_RMS: return "rms";
+    case B_ONLY_BRIDGE_REASON_ACQUIRING: return "acquiring";
+    case B_ONLY_BRIDGE_REASON_DEGRADED: return "degraded";
+    default: return "unknown";
+    }
+}
+
+static const char *phase_clock_reason_name(int reason)
+{
+    switch ((phase_clock_reason_t)reason) {
+    case PHASE_CLOCK_REASON_OK: return "ok";
+    case PHASE_CLOCK_REASON_BASELINE: return "baseline";
+    case PHASE_CLOCK_REASON_NO_SIGNAL: return "no-signal";
+    case PHASE_CLOCK_REASON_SIGMA: return "sigma";
+    case PHASE_CLOCK_REASON_ANCHOR: return "anchor";
+    case PHASE_CLOCK_REASON_REF_SWITCH: return "ref-switch";
+    case PHASE_CLOCK_REASON_INNOV: return "innov";
+    case PHASE_CLOCK_REASON_ACQUIRING: return "acquiring";
+    default: return "unknown";
+    }
+}
+
 static const char *target_mode_name(vrs_target_mode_t mode)
 {
     switch (mode) {
     case VRS_TARGET_BASE_A: return "base-a";
+    case VRS_TARGET_BASE_B: return "base-b";
     case VRS_TARGET_MIDPOINT:
     default: return "midpoint";
     }
@@ -2282,6 +2917,12 @@ static void set_virtual_target(double out[3])
         out[2] = g_arp_ecef[0][2];
         return;
     }
+    if (g_target_mode == VRS_TARGET_BASE_B) {
+        out[0] = g_arp_ecef[1][0];
+        out[1] = g_arp_ecef[1][1];
+        out[2] = g_arp_ecef[1][2];
+        return;
+    }
     out[0] = 0.5 * (g_arp_ecef[0][0] + g_arp_ecef[1][0]);
     out[1] = 0.5 * (g_arp_ecef[0][1] + g_arp_ecef[1][1]);
     out[2] = 0.5 * (g_arp_ecef[0][2] + g_arp_ecef[1][2]);
@@ -2291,6 +2932,7 @@ static void compute_backsolve_qc(
     const epoch_pair_t *pair, const obsd_t *common, int n_common,
     const virt_obs_t *a_only, int n_a_only,
     const common_cal_t *cal, const cross_source_bias_state_t *bias,
+    const phase_clock_diff_state_t *phase_clock,
     backsolve_qc_t *out)
 {
     const epoch_snap_t *s0 = pair->a;
@@ -2330,10 +2972,13 @@ static void compute_backsolve_qc(
                 out->n_common_p++;
             }
             if (ci >= 0 && ci < MAXCODE &&
-                common[i].L[j] != 0.0 && a->L[ja] != 0.0 &&
-                bias->phase_valid[sb][ci]) {
+                common[i].L[j] != 0.0 && a->L[ja] != 0.0) {
+                double phase_total_cyc;
+                if (!phase_total_offset_cyc(sb, ci, bias, phase_clock,
+                                            &phase_total_cyc))
+                    continue;
                 d = common[i].L[j] -
-                    (a->L[ja] + 0.5 * bias->phase_bias_ab_cyc[sb][ci]);
+                    (a->L[ja] + 0.5 * phase_total_cyc);
                 sum_common_l2 += d * d;
                 out->n_common_l++;
             }
@@ -2397,9 +3042,12 @@ static void try_synth_virtual_obs(void)
     common_cal_t common_cal;
     code_resid_diag_t code_diag;
     cross_source_bias_state_t bias_state;
+    phase_clock_diff_state_t phase_clock;
     baseline_state_t baseline;
     publish_plan_t plan;
     backsolve_qc_t backsolve_qc;
+    b_only_phase_dryrun_t b_only_phase_dryrun;
+    b_only_bridge_state_t b_only_bridge;
     int used_eph = 0;
     int n_shadow_a = 0, n_shadow_b = 0;
     int n_union_a = 0, n_union_b = 0;
@@ -2417,7 +3065,6 @@ static void try_synth_virtual_obs(void)
 
     b = norm3diff(g_arp_ecef[1], g_arp_ecef[0]);
     if (b <= 0.0) return;
-    baseline = make_baseline_state(b);
 
     print_enter();
 
@@ -2435,7 +3082,10 @@ static void try_synth_virtual_obs(void)
     memset(&common_cal, 0, sizeof(common_cal));
     memset(&code_diag, 0, sizeof(code_diag));
     memset(&bias_state, 0, sizeof(bias_state));
+    memset(&phase_clock, 0, sizeof(phase_clock));
     memset(&backsolve_qc, 0, sizeof(backsolve_qc));
+    memset(&b_only_phase_dryrun, 0, sizeof(b_only_phase_dryrun));
+    memset(&b_only_bridge, 0, sizeof(b_only_bridge));
 
     /* Prefer ephemeris-aware path (clean clock removal + true geometry). */
     if (g_nav_inited && g_nav_n_total() >= 4) {
@@ -2449,6 +3099,7 @@ static void try_synth_virtual_obs(void)
     if (!used_eph) {
         build_virt_obs_apollonius(&pair, &vis, b, virt, &nv);
     }
+    baseline = update_baseline_state(b, used_eph, virt, nv, pair.time);
     if (used_eph) {
         n_shadow_a = transfer_single_source_candidates(
             &pair, &vis, SRC_A_ONLY, g_arp_ecef[0], mid,
@@ -2460,15 +3111,26 @@ static void try_synth_virtual_obs(void)
             virt, nv, shadow_a_only, n_shadow_a, shadow_b_only, n_shadow_b,
             &shadow_union);
         estimate_cross_source_bias(&pair, &vis, &bias_state);
+        estimate_phase_clock_difference(
+            &common_cal, &baseline, &bias_state, pair.time,
+            g_qc_ref_switch, &phase_clock);
         n_union_a = adjust_single_source_for_union(
-            shadow_a_only, n_shadow_a, &bias_state, union_a_only, MAXOBS);
+            shadow_a_only, n_shadow_a, &bias_state, &phase_clock,
+            union_a_only, MAXOBS);
         n_union_b = adjust_single_source_for_union(
-            shadow_b_only, n_shadow_b, &bias_state, union_b_only, MAXOBS);
+            shadow_b_only, n_shadow_b, &bias_state, &phase_clock,
+            union_b_only, MAXOBS);
+        inspect_b_only_phase_dryrun(
+            shadow_b_only, n_shadow_b, &bias_state, &phase_clock, &pair,
+            &b_only_phase_dryrun);
+        b_only_bridge = update_b_only_bridge_state(
+            &b_only_phase_dryrun, pair.time);
         n_union_publish = assemble_publish_union_candidates(
             virt, nv, union_a_only, n_union_a, union_b_only, n_union_b,
             union_publish, &n_publish_extra);
         compute_backsolve_qc(&pair, virt, nv, shadow_a_only, n_shadow_a,
-                             &common_cal, &bias_state, &backsolve_qc);
+                             &common_cal, &bias_state, &phase_clock,
+                             &backsolve_qc);
         rms_eps_debiased = code_diag.residual_debiased_n > 0
                          ? code_diag.residual_rms_debiased_halfdiff_m
                          : rms_eps;
@@ -2562,14 +3224,17 @@ static void try_synth_virtual_obs(void)
     ssr_n = g_nav_ssr_orbclk_total();
 
     if (used_eph) {
-        printf("VRS [%s] :%u TX=%dB nv=%d | target=%s | mode=%s reason=%s extra=%d | baseline=%.3fm fixed=%d | vis A=%d B=%d common=%d | shadow A=%d B=%d union=%d | publish A=%d B=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
+        printf("VRS [%s] :%u TX=%dB nv=%d | target=%s | mode=%s reason=%s extra=%d | baseline=%.3fm state=%s/%s fixed=%d phase=%dsv/%dobs streak=%d bad=%d | vis A=%d B=%d common=%d | shadow A=%d B=%d union=%d | publish A=%d B=%d | clk_A=%+.3fm(%dsv) clk_B=%+.3fm(%dsv) "
                "d_clk=%+.3fm | rms((eps_A-eps_B)/2)=%.3fm | L: fix=%d float=%d drop=%d "
                "refSwap=%d",
                ssr_n >= 4 ? "ssr-com" : "brdc",
                (unsigned)RTCM_OUT_PORT, tx_agg_len, n_publish,
                target_mode_name(g_target_mode),
                vrs_mode_name(plan.mode), union_reason_name(plan.reason), plan.n_publish_extra,
-               baseline.length_m, baseline.fixed,
+               baseline.length_m, baseline_state_name(baseline.state),
+               baseline_reason_name(baseline.reason), baseline.fixed,
+               baseline.fixed_phase_sats, baseline.fixed_phase_obs,
+               baseline.fix_streak, baseline.bad_streak,
                vis.n_a_only, vis.n_b_only, vis.n_common,
                shadow_union.n_a_only, shadow_union.n_b_only, shadow_union.n,
                n_union_a, n_union_b,
@@ -2588,15 +3253,32 @@ static void try_synth_virtual_obs(void)
                g_nav_n_total(), ssr_n, g_ssr_nmsg, dec_obs, dec_sta, dec_err);
         if (backsolve_qc.enabled)
             print_code_resid_diag(&code_diag);
-        if (backsolve_qc.enabled)
+        if (g_target_mode != VRS_TARGET_MIDPOINT)
             print_code_bias_diag(&bias_state);
+        if (g_target_mode != VRS_TARGET_MIDPOINT)
+            print_phase_clock_diag(&bias_state, &phase_clock);
+        if (g_target_mode != VRS_TARGET_MIDPOINT)
+            print_b_only_phase_dryrun_diag(&b_only_phase_dryrun);
+        if (g_target_mode != VRS_TARGET_MIDPOINT &&
+            b_only_bridge.valid) {
+            printf("  b-only-bridge: state=%s/%s fixed=%d bridge=%d/%d rms=%.4fcyc streak=%d bad=%d\n",
+                   b_only_bridge_state_name(b_only_bridge.state),
+                   b_only_bridge_reason_name(b_only_bridge.reason),
+                   b_only_bridge.fixed,
+                   b_only_bridge.n_fixed, b_only_bridge.n_candidate,
+                   b_only_bridge.rms_resid_cyc,
+                   b_only_bridge.fix_streak, b_only_bridge.bad_streak);
+        }
     }
     else {
-        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d | target=%s | mode=%s reason=%s | baseline=%.3fm fixed=%d | vis A=%d B=%d common=%d | eph_n=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
+        printf("VRS [apollonius fallback] :%u TX=%dB nv=%d | target=%s | mode=%s reason=%s | baseline=%.3fm state=%s/%s fixed=%d phase=%dsv/%dobs streak=%d bad=%d | vis A=%d B=%d common=%d | eph_n=%d ssrSat=%d ssrMsg=%d | obs=%d sta=%d err=%d\n",
                (unsigned)RTCM_OUT_PORT, tx_agg_len, n_publish,
                target_mode_name(g_target_mode),
                vrs_mode_name(plan.mode), union_reason_name(plan.reason),
-               baseline.length_m, baseline.fixed,
+               baseline.length_m, baseline_state_name(baseline.state),
+               baseline_reason_name(baseline.reason), baseline.fixed,
+               baseline.fixed_phase_sats, baseline.fixed_phase_obs,
+               baseline.fix_streak, baseline.bad_streak,
                vis.n_a_only, vis.n_b_only, vis.n_common, g_nav_n_total(),
                ssr_n, g_ssr_nmsg,
                dec_obs, dec_sta, dec_err);
@@ -2775,8 +3457,8 @@ static void *stream_thread_proc(void *param)
 }
 #endif
 
-/* Parse: optional -v a, then repeating ((-c|-e) host port [label])+
- *   -v a                         put VRS target on the first base for backsolve QC
+/* Parse: optional -v a|-v b, then repeating ((-c|-e) host port [label])+
+ *   -v a|-v b                    put VRS target on base A or B for validation
  *   -c <host> <port> [label]   base station (obs + ARP, plus eph if present)
  *   -e <host> <port> [label]   corrections stream: BRDC/SSR only (no obs/ARP) */
 static int parse_client_streams(int argc, char **argv, cli_stream_t *out, int max_n)
@@ -2785,9 +3467,12 @@ static int parse_client_streams(int argc, char **argv, cli_stream_t *out, int ma
 
     g_target_mode = VRS_TARGET_MIDPOINT;
     if (i + 1 < argc && strcmp(argv[i], "-v") == 0) {
-        if (strcmp(argv[i + 1], "a") != 0)
+        if (strcmp(argv[i + 1], "a") == 0)
+            g_target_mode = VRS_TARGET_BASE_A;
+        else if (strcmp(argv[i + 1], "b") == 0)
+            g_target_mode = VRS_TARGET_BASE_B;
+        else
             return -1;
-        g_target_mode = VRS_TARGET_BASE_A;
         i += 2;
     }
     if (i >= argc || (strcmp(argv[i], "-c") != 0 && strcmp(argv[i], "-e") != 0))
@@ -3051,8 +3736,8 @@ static void usage(void)
     fprintf(stderr,
             "usage:\n"
             "  ntrip_rtcm_obs [listen_port] [label]     TCP server (default port %d)\n"
-            "  ntrip_rtcm_obs [-v a] (-c|-e) <host> <port> [label] [(-c|-e) <host> <port> [label] ...]\n"
-            "      -v a put the virtual point on the first base for backsolve validation\n"
+            "  ntrip_rtcm_obs [-v a|-v b] (-c|-e) <host> <port> [label] [(-c|-e) <host> <port> [label] ...]\n"
+            "      -v a|-v b put the virtual point on base A or base B for validation\n"
             "      -c   base station stream  (obs + ARP, eph also accepted)\n"
             "      -e   BRDC/SSR correction stream, e.g. SSRC00CNE0 (no obs/ARP used)\n"
             "      Multiple streams run in one process (one thread each).\n"
